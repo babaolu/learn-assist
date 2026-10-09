@@ -1,44 +1,46 @@
-# Python Virtual Environment & Cache
+# Source PDFs and copyright-restricted materials (never commit)
+book/
+data/
+
+# Python Virtual Environment & Caches
 .venv/
+venv/
+env/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.log
 
-# Sensitive environment variables
+# Environment variables & secrets
 .env
 .env.*
 
-# Book-specific proprietary source files (Strictly excluded)
+# Textbook documents
 *.pdf
-books/*
-!books/.gitkeep
-!books/sample_book/
-!books/sample_book/**
-COMMUNICATION PROCESS, MANAGEMENT & DEVELOPMENT (INTERMEDIATE I).md
-COMMUNICATION PROCESS, MANAGEMENT & DEVELOPMENT (INTERMEDIATE I).pdf
 
-# Generated Audio Lectures & Output artifacts
-*.mp3
-*.wav
-output_lectures/*/
-output_lectures/*.json
-output_lectures/*.md
-output_lectures/*.mp3
+# Model weights
+models/
+*.gguf
+*.bin
+*.safetensors
+*.onnx
 
-# Graphify build outputs & incremental caches
-graphify-out/*
-!graphify-out/.gitkeep
+# OCR & page-image caches
+ocr_cache/
+page_cache/
+page_images/
+images_cache/
+.cache/
+cache/
+*_cache/
+*.png
+*.jpg
+*.jpeg
+*.tiff
+*.bmp
+*.webp
 
-# Keep directories present in git
-!.gitkeep
-!books/.gitkeep
-!output_lectures/.gitkeep
-!books/sample_book/book_config.example.json
-
-# Scratch & OS Files
-scratch/
+# OS and Editor files
 .DS_Store
 Thumbs.db
 *.swp
