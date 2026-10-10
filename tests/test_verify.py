@@ -27,9 +27,12 @@ from learn_assist.verify import (
     check_section_hierarchy,
     check_cross_model_spot,
     check_sub_equation_sweep,
+    check_pdf_text_layer_coverage,
     extract_equation_labels,
     extract_equation_numbers,
     extract_section_headings,
+    extract_pdf_text_labels,
+    select_stratified_sample,
     CORRUPT_OCR_PATTERNS,
 )
 
@@ -430,3 +433,56 @@ def test_latex_integrity_catches_mid_word_start(tmp_path: Path):
     passed, failures, stats = check_latex_integrity(pages_dir)
     assert passed is False
     assert any("Page 70" in f and "mid-word" in f for f in failures)
+
+
+def test_pdf_text_layer_coverage_catches_missing_in_transcription(tmp_path: Path):
+    import pymupdf
+    pdf_path = tmp_path / "test.pdf"
+    doc = pymupdf.open()
+    for _ in range(32):
+        doc.new_page()
+    p33 = doc.new_page()
+    p33.insert_text((50, 100), "Formula here \n(2.1)\n")
+    doc.save(pdf_path)
+
+    pages_dir = tmp_path / "pages"
+    pages_dir.mkdir()
+    # Transcribe page 33 without (2.1)
+    (pages_dir / "page_0033.md").write_text("Formula here without tag.")
+
+    passed, failures, stats = check_pdf_text_layer_coverage(
+        pdf_path=pdf_path,
+        pages_dir=pages_dir,
+        in_scope_pages=[33]
+    )
+    assert passed is False
+    assert len(failures) == 1
+    assert any("2.1" in f and "MISSING" in f for f in failures)
+    assert stats["failed_pages"] == [33]
+
+
+def test_pdf_text_layer_coverage_warns_when_missing_in_pdf(tmp_path: Path):
+    import pymupdf
+    pdf_path = tmp_path / "test.pdf"
+    doc = pymupdf.open()
+    for _ in range(32):
+        doc.new_page()
+    p33 = doc.new_page()
+    p33.insert_text((50, 100), "Formula with destroyed OCR text layer")
+    doc.save(pdf_path)
+
+    pages_dir = tmp_path / "pages"
+    pages_dir.mkdir()
+    # Transcription has (2.1)
+    (pages_dir / "page_0033.md").write_text(r"$$ y = x \quad (2.1) $$")
+
+    passed, failures, stats = check_pdf_text_layer_coverage(
+        pdf_path=pdf_path,
+        pages_dir=pages_dir,
+        in_scope_pages=[33]
+    )
+    assert passed is True  # Warning does not cause failure
+    assert len(failures) == 0
+    assert stats["warning_pages"] == [33]
+    assert any("2.1" in w for w in stats["warnings"])
+

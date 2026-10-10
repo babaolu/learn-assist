@@ -4,14 +4,16 @@ learn_assist.verify
 
 Verification suite for Stage 1 textbook ingestion and extraction:
 a) COMPLETENESS: Every page in range has a non-empty checkpoint >= min character threshold.
-b) EQUATION SEQUENCE: (2.1)..(2.141) and (3.1)..(3.153) contiguous with no gaps and no duplicates,
+b) EQUATION SEQUENCE: (2.1)..(2.141) and (3.1)..(3.154) contiguous with no gaps and no duplicates,
    with letter suffixes starting from 'a' with no gaps, and no base appearing both bare and lettered.
 c) SECTION & FIGURE/TABLE SEQUENCE: Section numbers, subsections, Figure numbers, and Table numbers contiguous.
 d) PROBLEM SEQUENCE: Chapter end-of-chapter problems contiguous with no gaps and no duplicates.
 e) LATEX & OCR INTEGRITY: Balanced $ and $$, no corrupted OCR signatures, no mid-word starts.
-f) CROSS-MODEL SPOT CHECK: Dual-model verification on densest and random pages, classifying outcomes as
-   AGREE, DISAGREE, or UNVERIFIED, asserting coverage threshold with 180s+ timeout and exponential backoff.
-g) SUB-EQUATION SWEEP: Full scan of all pages for equation jumps > 1 or bare labels where lettered exist.
+f) PDF TEXT LAYER 100% COVERAGE: Independent comparison of equation labels from the PDF OCR text layer
+   versus transcription across all 93 in-scope pages.
+g) CROSS-MODEL SPOT CHECK: Dual-model verification on densest and random pages (ranked by PDF text layer),
+   classifying outcomes as AGREE, DISAGREE, or UNVERIFIED, with 180s+ timeout and exponential backoff.
+h) SUB-EQUATION SWEEP: Full scan of all pages for equation jumps > 1 or bare labels where lettered exist.
 
 Outputs full audit log to data/verification_report.md.
 EXITS NON-ZERO IF ANY CHECK FAILS.
@@ -30,10 +32,12 @@ from typing import List, Dict, Set, Tuple, Any, Optional
 from collections import defaultdict
 
 import requests
+import pymupdf
 
 from learn_assist.ingest import (
     DEFAULT_API_KEY,
     clean_markdown_fences,
+    find_source_pdf,
     TRANSCRIPTION_PROMPT,
 )
 
@@ -42,7 +46,7 @@ IN_SCOPE_PAGES = list(range(33, 126))  # PDF 33 to 125 inclusive (93 pages)
 CH2_PAGES = list(range(33, 77))        # PDF 33 to 76 (Book 13 to 56)
 CH3_PAGES = list(range(77, 126))       # PDF 77 to 125 (Book 57 to 105)
 
-# Standard sample of 9 pages previously attempted (5 verified, 4 timed out)
+# Standard sample of 9 pages (dense and random)
 DEFAULT_SPOT_SAMPLE = [36, 46, 47, 50, 61, 64, 68, 114, 119]
 
 CORRUPT_OCR_PATTERNS = [
@@ -489,12 +493,115 @@ def check_latex_integrity(pages_dir: Path) -> Tuple[bool, List[str], Dict[str, A
     return len(failures) == 0, failures, stats
 
 
+def extract_pdf_text_labels(page_text: str, ch_num: int) -> List[str]:
+    """
+    Extracts equation labels of the form (ch_num.M) or (ch_num.Ma) from the PDF text layer.
+    Filters out in-text citations like Eq. (2.9), Eqs. (2.44), etc.
+    """
+    labels = []
+    lines = page_text.splitlines()
+    for line in lines:
+        line_s = line.strip()
+        for m in re.finditer(rf'\({ch_num}\.(\d+[a-z]?)\)', line_s):
+            prefix = line_s[:m.start()].strip()
+            suffix = line_s[m.end():].strip()
+            # Ignore citations in prose: preceded by Eq., Eqs., Equation, in, see, from, and, or, of
+            if re.search(r'\b(?:Eqs?\.?|ofEq\.?|Equations?\.?|see|from|in|and|or|between|with|to)\b', prefix, re.IGNORECASE):
+                continue
+            if any(w in prefix.lower() for w in ['defined', 'given', 'using', 'as shown', 'recall']):
+                continue
+            # If line has words after the equation tag, it's running text unless punctuation
+            if re.search(r'^[a-zA-Z]{2,}', suffix):
+                continue
+            labels.append(f"{ch_num}.{m.group(1).lower()}")
+    return sorted(set(labels))
+
+
+def check_pdf_text_layer_coverage(
+    pdf_path: Optional[Path] = None,
+    pages_dir: Path = Path("data/pages"),
+    in_scope_pages: List[int] = IN_SCOPE_PAGES
+) -> Tuple[bool, List[str], Dict[str, Any]]:
+    """
+    Check f) INDEPENDENT LABEL COUNT FROM THE PDF TEXT LAYER — 100% coverage:
+    For every in-scope page:
+    - extracts equation labels from the PDF text layer for that page
+    - extracts equation labels from the transcription for that page
+    - compares the two sets and flags any page where they differ
+    Treats label present in text layer but absent from transcription as FAILURE.
+    Treats label present in transcription but absent from text layer as WARNING.
+    """
+    source_pdf = pdf_path or find_source_pdf(Path("book"))
+    if not source_pdf or not source_pdf.exists():
+        return False, [f"PDF source file not found at {source_pdf}"], {}
+
+    doc = pymupdf.open(source_pdf)
+    failures = []
+    warnings = []
+    per_page_results = []
+    failed_pages = []
+    warning_pages = []
+    clean_pages = []
+
+    for p in in_scope_pages:
+        ch = 2 if p in CH2_PAGES else 3
+        pdf_page = doc[p - 1]
+        pdf_text = pdf_page.get_text()
+        pdf_lbls = extract_pdf_text_labels(pdf_text, ch)
+
+        trans_file = pages_dir / f"page_{p:04d}.md"
+        trans_text = trans_file.read_text(encoding="utf-8") if trans_file.exists() else ""
+        trans_lbls = sorted(set(item[2] for item in extract_equation_labels(trans_text, ch)))
+
+        missing_in_trans = sorted(set(pdf_lbls) - set(trans_lbls))
+        missing_in_pdf = sorted(set(trans_lbls) - set(pdf_lbls))
+
+        if missing_in_trans:
+            status = "FAIL"
+            failed_pages.append(p)
+            failures.append(
+                f"Page {p} (Book p. {p - 20}): Label(s) present in PDF text layer but MISSING from transcription: {missing_in_trans}"
+            )
+        elif missing_in_pdf:
+            status = "WARN"
+            warning_pages.append(p)
+            warnings.append(
+                f"Page {p} (Book p. {p - 20}): Label(s) present in transcription but absent from lossy PDF text layer: {missing_in_pdf}"
+            )
+        else:
+            status = "PASS"
+            clean_pages.append(p)
+
+        per_page_results.append({
+            "page": p,
+            "book_page": p - 20,
+            "pdf_labels": pdf_lbls,
+            "trans_labels": trans_lbls,
+            "missing_in_trans": missing_in_trans,
+            "missing_in_pdf": missing_in_pdf,
+            "status": status
+        })
+
+    stats = {
+        "total_pages": len(in_scope_pages),
+        "clean_pages_count": len(clean_pages),
+        "failed_pages_count": len(failed_pages),
+        "warning_pages_count": len(warning_pages),
+        "failed_pages": failed_pages,
+        "warning_pages": warning_pages,
+        "warnings": warnings,
+        "per_page_results": per_page_results
+    }
+
+    return len(failures) == 0, failures, stats
+
+
 def check_sub_equation_sweep(
     pages_dir: Path,
     in_scope_pages: List[int] = IN_SCOPE_PAGES
 ) -> Tuple[bool, List[str], Dict[str, Any]]:
     """
-    Check g) SUB-EQUATION SWEEP:
+    Check h) SUB-EQUATION SWEEP:
     Independent of sampling, scans every in-scope page's transcription for:
     1. Pages where the equation labels jump by more than one (within page or across adjacent pages).
     2. Any label appearing bare that appears lettered elsewhere.
@@ -582,6 +689,7 @@ def check_sub_equation_sweep(
 
 def select_stratified_sample(
     pages_dir: Path,
+    pdf_path: Optional[Path] = None,
     in_scope_pages: List[int] = IN_SCOPE_PAGES,
     sample_ratio: float = 0.10,
     dense_ratio: float = 0.50,
@@ -589,20 +697,31 @@ def select_stratified_sample(
 ) -> Tuple[List[int], List[int]]:
     """
     Selects sample of in-scope pages stratified by equation count:
-    - Rank in-scope pages by equation count descending
-    - Sample the densest pages preferentially
-    - Sample random pages for an unbiased signal
+    - Ranks in-scope pages by TEXT-LAYER label count (to prevent circular bias)
+    - Samples the densest pages preferentially
+    - Samples random pages for an unbiased signal
     Returns (dense_pages, random_pages).
     """
+    source_pdf = pdf_path or find_source_pdf(Path("book"))
     page_eq_counts = []
-    for p in in_scope_pages:
-        page_file = pages_dir / f"page_{p:04d}.md"
-        ch = 2 if p in CH2_PAGES else 3
-        count = 0
-        if page_file.exists():
-            text = page_file.read_text(encoding="utf-8")
-            count = len(extract_equation_labels(text, ch))
-        page_eq_counts.append((p, count))
+
+    if source_pdf and source_pdf.exists():
+        doc = pymupdf.open(source_pdf)
+        for p in in_scope_pages:
+            ch = 2 if p in CH2_PAGES else 3
+            pdf_text = doc[p - 1].get_text()
+            count = len(extract_pdf_text_labels(pdf_text, ch))
+            page_eq_counts.append((p, count))
+    else:
+        # Fallback to transcription count if PDF unavailable
+        for p in in_scope_pages:
+            page_file = pages_dir / f"page_{p:04d}.md"
+            ch = 2 if p in CH2_PAGES else 3
+            count = 0
+            if page_file.exists():
+                text = page_file.read_text(encoding="utf-8")
+                count = len(extract_equation_labels(text, ch))
+            page_eq_counts.append((p, count))
 
     # Rank by count desc, ties broken by page asc
     page_eq_counts.sort(key=lambda x: (x[1], -x[0]), reverse=True)
@@ -692,45 +811,50 @@ def check_cross_model_spot(
     cross_model: str = "gemma-4-31b-it",
     retranscribe: bool = False,
     sampled_pages: Optional[List[int]] = None,
-    cross_dir: Path = Path("data/cross_model")
+    cross_dir: Path = Path("data/cross_model"),
+    pdf_path: Optional[Path] = None
 ) -> Tuple[bool, List[str], Dict[str, Any]]:
     """
-    Check f) Cross-Model Spot Check:
+    Check g) Cross-Model Spot Check:
     - Classifies three outcomes separately: AGREE, DISAGREE, UNVERIFIED.
     - A timeout is recorded as UNVERIFIED (never DISAGREE or AGREE).
     - Any page left UNVERIFIED is a coverage failure.
     - Reports achieved coverage percentage vs target.
-    - Evaluates dense and random groups separately.
-    - Re-transcribes nothing by default (inspects cached results in data/cross_model).
+    - Evaluates dense and random groups separately, ranked by PDF text layer.
     """
     failures = []
     cross_dir.mkdir(parents=True, exist_ok=True)
     images_dir = Path("data/page_images")
 
+    source_pdf = pdf_path or find_source_pdf(Path("book"))
+    pdf_doc = pymupdf.open(source_pdf) if (source_pdf and source_pdf.exists()) else None
+
     # Determine sample
     if sampled_pages is not None:
         all_sampled = sorted(sampled_pages)
-        # Classify by equation density
+        # Classify by equation density using PDF text layer count
         page_counts = []
         for p in all_sampled:
-            pf = pages_dir / f"page_{p:04d}.md"
             ch = 2 if p in CH2_PAGES else 3
-            cnt = len(extract_equation_labels(pf.read_text(), ch)) if pf.exists() else 0
+            if pdf_doc:
+                cnt = len(extract_pdf_text_labels(pdf_doc[p - 1].get_text(), ch))
+            else:
+                pf = pages_dir / f"page_{p:04d}.md"
+                cnt = len(extract_equation_labels(pf.read_text(), ch)) if pf.exists() else 0
             page_counts.append((p, cnt))
         page_counts.sort(key=lambda x: (x[1], -x[0]), reverse=True)
         dense_pages = sorted([p for p, c in page_counts[:len(all_sampled)//2]])
         random_pages = sorted([p for p in all_sampled if p not in dense_pages])
     elif not retranscribe:
-        # Default diagnostic run: evaluate the established 9-page sample
         all_sampled = sorted(DEFAULT_SPOT_SAMPLE)
-        # Dense vs random partition of the established sample based on equation count
-        # High equation pages: 46 (8), 50 (8), 119 (8), 36 (7), 61 (4)
-        # Low/unbiased pages: 64 (2), 47 (0), 68 (0), 114 (0)
+        # Classify default sample by text-layer density:
+        # Pages 46 (8), 119 (8), 50 (7), 36 (6), 61 (4) -> dense
+        # Pages 64 (2), 47 (0), 68 (0), 114 (0) -> random
         dense_pages = [36, 46, 50, 61, 119]
         random_pages = [47, 64, 68, 114]
     else:
         dense_pages, random_pages = select_stratified_sample(
-            pages_dir, IN_SCOPE_PAGES, sample_ratio=sample_ratio, seed=seed
+            pages_dir, pdf_path=source_pdf, in_scope_pages=IN_SCOPE_PAGES, sample_ratio=sample_ratio, seed=seed
         )
         all_sampled = sorted(dense_pages + random_pages)
 
@@ -864,6 +988,7 @@ def generate_verification_report(
     sections_res: Tuple[bool, List[str], Dict[str, Any]],
     problems_res: Tuple[bool, List[str], Dict[str, Any]],
     latex_res: Tuple[bool, List[str], Dict[str, Any]],
+    pdf_cov_res: Tuple[bool, List[str], Dict[str, Any]],
     cross_res: Tuple[bool, List[str], Dict[str, Any]],
     sweep_res: Tuple[bool, List[str], Dict[str, Any]],
     output_path: Path
@@ -875,6 +1000,7 @@ def generate_verification_report(
         sections_res[0],
         problems_res[0],
         latex_res[0],
+        pdf_cov_res[0],
         cross_res[0],
         sweep_res[0]
     ])
@@ -897,8 +1023,9 @@ def generate_verification_report(
         f"| c) Section / Figure / Table | Contiguous structure hierarchy (sections & subsections) | {'PASS' if sections_res[0] else 'FAIL'} |",
         f"| d) Problem Sequence | Contiguous end-of-chapter problems | {'PASS' if problems_res[0] else 'FAIL'} |",
         f"| e) LaTeX & OCR Integrity | Balanced delimiters, no corrupted OCR artifacts | {'PASS' if latex_res[0] else 'FAIL'} |",
-        f"| f) Cross-Model Spot Check | Dual-model verification (AGREE / DISAGREE / UNVERIFIED, coverage %) | {'PASS' if cross_res[0] else 'FAIL'} |",
-        f"| g) Sub-Equation Sweep | Full scan for equation jumps > 1 and bare/lettered conflicts | {'PASS' if sweep_res[0] else 'FAIL'} |",
+        f"| f) PDF Text Layer 100% Coverage | Full independent comparison of PDF text layer vs transcription | {'PASS' if pdf_cov_res[0] else 'FAIL'} |",
+        f"| g) Cross-Model Spot Check | Dual-model verification (AGREE / DISAGREE / UNVERIFIED, coverage %) | {'PASS' if cross_res[0] else 'FAIL'} |",
+        f"| h) Sub-Equation Sweep | Full scan for equation jumps > 1 and bare/lettered conflicts | {'PASS' if sweep_res[0] else 'FAIL'} |",
         "",
         "---",
         "",
@@ -912,8 +1039,9 @@ def generate_verification_report(
         ("c) Section / Figure / Table Sequence", sections_res),
         ("d) Problem Sequence", problems_res),
         ("e) LaTeX & OCR Integrity", latex_res),
-        ("f) Cross-Model Spot Check", cross_res),
-        ("g) Sub-Equation Sweep", sweep_res),
+        ("f) PDF Text Layer 100% Coverage", pdf_cov_res),
+        ("g) Cross-Model Spot Check", cross_res),
+        ("h) Sub-Equation Sweep", sweep_res),
     ]
 
     for name, res in checks:
@@ -927,7 +1055,27 @@ def generate_verification_report(
                     lines.append(f"  - {sub_line}" if not sub_line.startswith("  ") else sub_line)
         else:
             lines.append("- **Details:** All assertions satisfied.")
-        if stats:
+
+        # Special rendering for Check f (PDF Text Layer Coverage) table
+        if name == "f) PDF Text Layer 100% Coverage" and "per_page_results" in stats:
+            lines.append("")
+            lines.append(f"- **Total Pages Audited:** {stats['total_pages']}")
+            lines.append(f"- **Clean Matches (Exact Match):** {stats['clean_pages_count']}")
+            lines.append(f"- **Pages with Failures (In PDF, Missing in Transcription):** {stats['failed_pages_count']} ({stats['failed_pages']})")
+            lines.append(f"- **Pages with Warnings (In Transcription, Absent from Lossy Text Layer):** {stats['warning_pages_count']} ({stats['warning_pages']})")
+            lines.append("")
+            lines.append("#### Full Per-Page Comparison Table (93 Pages)")
+            lines.append("")
+            lines.append("| Page | Book Page | PDF Text Layer Labels | Transcription Labels | Missing in Trans (FAIL) | Missing in PDF (WARN) | Status |")
+            lines.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+            for r in stats["per_page_results"]:
+                pdf_str = ", ".join(r["pdf_labels"]) if r["pdf_labels"] else "—"
+                trans_str = ", ".join(r["trans_labels"]) if r["trans_labels"] else "—"
+                fail_str = ", ".join(r["missing_in_trans"]) if r["missing_in_trans"] else "—"
+                warn_str = ", ".join(r["missing_in_pdf"]) if r["missing_in_pdf"] else "—"
+                lines.append(f"| {r['page']} | {r['book_page']} | {pdf_str} | {trans_str} | {fail_str} | {warn_str} | {r['status']} |")
+            lines.append("")
+        elif stats:
             lines.append(f"```json\n{json.dumps(stats, indent=2)}\n```")
         lines.append("")
 
@@ -941,6 +1089,7 @@ def run_verification(
     pages_dir: Path = Path("data/pages"),
     chapters_dir: Path = Path("data/chapters"),
     problems_dir: Path = Path("data/problems"),
+    pdf_path: Optional[Path] = None,
     report_path: Path = Path("data/verification_report.md"),
     api_key: Optional[str] = None,
     retranscribe: bool = False
@@ -950,40 +1099,44 @@ def run_verification(
     print("LEARN-ASSIST STAGE 1 VERIFICATION")
     print("=" * 60)
 
-    print("\n[1/7] Verifying a) Completeness...")
+    print("\n[1/8] Verifying a) Completeness...")
     comp_res = check_completeness(pages_dir)
     print(f"  -> {'PASS' if comp_res[0] else 'FAIL'}")
 
-    print("\n[2/7] Verifying b) Equation Sequence...")
+    print("\n[2/8] Verifying b) Equation Sequence...")
     eq_res = check_equations(chapters_dir)
     print(f"  -> {'PASS' if eq_res[0] else 'FAIL'}")
 
-    print("\n[3/7] Verifying c) Section, Figure, and Table Sequence...")
+    print("\n[3/8] Verifying c) Section, Figure, and Table Sequence...")
     sec_res = check_sections_and_figures(chapters_dir)
     print(f"  -> {'PASS' if sec_res[0] else 'FAIL'}")
 
-    print("\n[4/7] Verifying d) Problem Sequence...")
+    print("\n[4/8] Verifying d) Problem Sequence...")
     prob_res = check_problem_sequence(problems_dir)
     print(f"  -> {'PASS' if prob_res[0] else 'FAIL'}")
 
-    print("\n[5/7] Verifying e) LaTeX Integrity & Corrupted OCR Signatures...")
+    print("\n[5/8] Verifying e) LaTeX Integrity & Corrupted OCR Signatures...")
     latex_res = check_latex_integrity(pages_dir)
     print(f"  -> {'PASS' if latex_res[0] else 'FAIL'}")
 
-    print("\n[6/7] Verifying f) Cross-Model Spot Check...")
-    cross_res = check_cross_model_spot(pages_dir, api_key=api_key, retranscribe=retranscribe)
+    print("\n[6/8] Verifying f) PDF Text Layer 100% Coverage...")
+    pdf_cov_res = check_pdf_text_layer_coverage(pdf_path=pdf_path, pages_dir=pages_dir)
+    print(f"  -> {'PASS' if pdf_cov_res[0] else 'FAIL'}")
+
+    print("\n[7/8] Verifying g) Cross-Model Spot Check...")
+    cross_res = check_cross_model_spot(pages_dir, api_key=api_key, retranscribe=retranscribe, pdf_path=pdf_path)
     print(f"  -> {'PASS' if cross_res[0] else 'FAIL'}")
 
-    print("\n[7/7] Verifying g) Sub-Equation Sweep (93 pages)...")
+    print("\n[8/8] Verifying h) Sub-Equation Sweep (93 pages)...")
     sweep_res = check_sub_equation_sweep(pages_dir)
     print(f"  -> {'PASS' if sweep_res[0] else 'FAIL'}")
 
     report = generate_verification_report(
-        comp_res, eq_res, sec_res, prob_res, latex_res, cross_res, sweep_res, report_path
+        comp_res, eq_res, sec_res, prob_res, latex_res, pdf_cov_res, cross_res, sweep_res, report_path
     )
 
     all_passed = all([
-        comp_res[0], eq_res[0], sec_res[0], prob_res[0], latex_res[0], cross_res[0], sweep_res[0]
+        comp_res[0], eq_res[0], sec_res[0], prob_res[0], latex_res[0], pdf_cov_res[0], cross_res[0], sweep_res[0]
     ])
 
     print("\n" + "=" * 60)
@@ -1002,6 +1155,7 @@ def main():
     parser.add_argument("--pages-dir", type=Path, default=Path("data/pages"), help="Pages directory")
     parser.add_argument("--chapters-dir", type=Path, default=Path("data/chapters"), help="Chapters directory")
     parser.add_argument("--problems-dir", type=Path, default=Path("data/problems"), help="Problems directory")
+    parser.add_argument("--pdf-path", type=Path, default=None, help="Source PDF file path")
     parser.add_argument("--report", type=Path, default=Path("data/verification_report.md"), help="Report output path")
     parser.add_argument("--api-key", type=str, default=None, help="API key for cross-model spot check")
     parser.add_argument("--retranscribe", action="store_true", default=False, help="Enable API re-transcription of uncached spot check pages")
@@ -1011,6 +1165,7 @@ def main():
         pages_dir=args.pages_dir,
         chapters_dir=args.chapters_dir,
         problems_dir=args.problems_dir,
+        pdf_path=args.pdf_path,
         report_path=args.report,
         api_key=args.api_key,
         retranscribe=args.retranscribe
