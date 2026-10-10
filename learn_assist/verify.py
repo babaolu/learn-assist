@@ -4,12 +4,14 @@ learn_assist.verify
 
 Verification suite for Stage 1 textbook ingestion and extraction:
 a) COMPLETENESS: Every page in range has a non-empty checkpoint >= min character threshold.
-b) EQUATION SEQUENCE: (2.1)..(2.141) and (3.1)..(3.153) contiguous with no gaps and no duplicates.
-c) SECTION & FIGURE/TABLE SEQUENCE: Section numbers, Figure numbers, and Table numbers contiguous.
+b) EQUATION SEQUENCE: (2.1)..(2.141) and (3.1)..(3.153) contiguous with no gaps and no duplicates,
+   with letter suffixes starting from 'a' with no gaps, and no base appearing both bare and lettered.
+c) SECTION & FIGURE/TABLE SEQUENCE: Section numbers, subsections, Figure numbers, and Table numbers contiguous.
 d) PROBLEM SEQUENCE: Chapter end-of-chapter problems contiguous with no gaps and no duplicates.
 e) LATEX & OCR INTEGRITY: Balanced $ and $$, no corrupted OCR signatures, no mid-word starts.
-f) CROSS-MODEL SPOT CHECK: 10% sample re-transcribed with a different model family, asserting
-   agreement on equation numbers and section headings.
+f) CROSS-MODEL SPOT CHECK: Dual-model verification on densest and random pages, classifying outcomes as
+   AGREE, DISAGREE, or UNVERIFIED, asserting coverage threshold with 180s+ timeout and exponential backoff.
+g) SUB-EQUATION SWEEP: Full scan of all pages for equation jumps > 1 or bare labels where lettered exist.
 
 Outputs full audit log to data/verification_report.md.
 EXITS NON-ZERO IF ANY CHECK FAILS.
@@ -19,26 +21,29 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import re
-import sys
 import json
+import time
+import base64
 import random
 import argparse
-from pathlib import Path
 from typing import List, Dict, Set, Tuple, Any, Optional
+from collections import defaultdict
 
 import requests
-import pymupdf
 
 from learn_assist.ingest import (
     DEFAULT_API_KEY,
-    transcribe_page_image,
-    render_page_to_png,
+    clean_markdown_fences,
+    TRANSCRIPTION_PROMPT,
 )
 
 MIN_CHAR_THRESHOLD = 150
 IN_SCOPE_PAGES = list(range(33, 126))  # PDF 33 to 125 inclusive (93 pages)
 CH2_PAGES = list(range(33, 77))        # PDF 33 to 76 (Book 13 to 56)
 CH3_PAGES = list(range(77, 126))       # PDF 77 to 125 (Book 57 to 105)
+
+# Standard sample of 9 pages previously attempted (5 verified, 4 timed out)
+DEFAULT_SPOT_SAMPLE = [36, 46, 47, 50, 61, 64, 68, 114, 119]
 
 CORRUPT_OCR_PATTERNS = [
     r'\(f>',
@@ -49,21 +54,6 @@ CORRUPT_OCR_PATTERNS = [
     r'ysincf',
     r'\{R2p\}',
 ]
-
-
-class VerificationResult:
-    def __init__(self):
-        self.passed = True
-        self.failures: List[Dict[str, Any]] = []
-        self.details: Dict[str, Any] = {}
-
-    def fail(self, check_name: str, message: str, context: Optional[Any] = None):
-        self.passed = False
-        self.failures.append({
-            "check": check_name,
-            "message": message,
-            "context": context
-        })
 
 
 def check_completeness(pages_dir: Path, min_chars: int = MIN_CHAR_THRESHOLD) -> Tuple[bool, List[str], Dict[str, int]]:
@@ -86,20 +76,71 @@ def check_completeness(pages_dir: Path, min_chars: int = MIN_CHAR_THRESHOLD) -> 
     return len(failures) == 0, failures, page_counts
 
 
+def extract_equation_labels(text: str, ch_num: int) -> List[Tuple[int, str, str, int, str]]:
+    """
+    Extracts all defined equation labels for a chapter from Markdown text.
+    Returns list of tuples: (base_num, letter_suffix, full_tag, line_no, raw_line).
+    Handles:
+      (2.79a), (2.80b), (2.79), (2.79\\text{a}), (2.79\\mathrm{a}), \\tag{2.79a}, etc.
+    Filters out in-text citations such as Eq. (2.9), Eqs. (2.44), Equation (2.101).
+    """
+    labels = []
+    lines = text.splitlines()
+
+    # Matches equation labels like:
+    # \tag{2.79a}, \tag{2.79\text{a}}, (2.79a), (2.79\text{a}), (2.79)
+    raw_pattern = re.compile(
+        rf'(?:\\tag\*?\{{|\(\s*){ch_num}\.(\d+)(?:\\(?:text|mathrm|mathbf)\{{([a-zA-Z])\}}|\s*([a-zA-Z]))?\s*(?:\}}|\))'
+    )
+
+    in_math_block = False
+
+    for line_no, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if stripped.startswith("$$") and stripped.endswith("$$") and len(stripped) > 4:
+            line_in_math = True
+        elif "$$" in stripped:
+            count = stripped.count("$$")
+            if count % 2 == 1:
+                in_math_block = not in_math_block
+                line_in_math = True
+            else:
+                line_in_math = in_math_block or True
+        else:
+            line_in_math = in_math_block
+
+        for m in raw_pattern.finditer(line):
+            prefix = line[:m.start()].rstrip()
+            suffix = line[m.end():].lstrip()
+
+            # Filter citations
+            if re.search(r'\b(?:Eqs?\.?|Equations?\.?|see|from|in|and|or|ref|with|to|by|into|of)\s*\(?$', prefix, re.IGNORECASE):
+                continue
+            if re.search(r'\b(?:between|similarly\s+to|as\s+in|according\s+to)\b.*$', prefix, re.IGNORECASE):
+                continue
+
+            is_tag = r"\tag" in m.group(0) or prefix.endswith(r"\tag")
+            has_math_spacing = bool(re.search(r'(?:\\(?:quad|qquad|hfill|hspace\{[^}]+\})|&)\s*$', prefix))
+            is_display_math = line_in_math or has_math_spacing or is_tag
+
+            if not is_display_math:
+                continue
+
+            num = int(m.group(1))
+            letter = (m.group(2) or m.group(3) or "").lower()
+            tag = f"{ch_num}.{num}{letter}"
+            labels.append((num, letter, tag, line_no, line.strip()))
+
+    return labels
+
+
 def extract_equation_numbers(text: str, chapter_num: int) -> Tuple[List[int], List[str]]:
     """
-    Extracts all defined equation numbers for a chapter from Markdown text.
-    Handles standard integers and lettered equations (e.g. 2.16, 2.24a, 2.24b).
-    Returns list of base integers and list of raw strings.
+    Extracts base integers and raw tags for backwards compatibility.
     """
-    # Match tags like (2.14), (2.117), \tag{2.117}, \quad (2.117), (2.122a)
-    raw_matches = re.findall(rf'(?:\\tag\{{|\(|\bEq\.\s*\(?){chapter_num}\.(\d+)([a-z]?)\)?', text)
-    base_ints = []
-    raw_tags = []
-    for num_str, letter in raw_matches:
-        base_int = int(num_str)
-        base_ints.append(base_int)
-        raw_tags.append(f"{chapter_num}.{num_str}{letter}")
+    labels = extract_equation_labels(text, chapter_num)
+    base_ints = [item[0] for item in labels]
+    raw_tags = [item[2] for item in labels]
     return base_ints, raw_tags
 
 
@@ -129,44 +170,180 @@ def check_sequence_contiguity(
     if extra:
         failures.append(f"{name}: Unexpected sequence numbers outside {start_val}..{end_val}: {extra}")
 
-    # Check for duplicates if original list has duplicates
+    # Check for duplicates
     counts: Dict[int, int] = {}
     for x in items:
         counts[x] = counts.get(x, 0) + 1
     duplicates = [x for x, c in counts.items() if c > 1 and start_val <= x <= end_val]
-    # Note: Lettered equations sharing base int (e.g., 2.24a, 2.24b) are permitted, handled in caller.
+    if duplicates:
+        failures.append(f"{name}: Duplicate sequence numbers: {duplicates}")
 
     return len(failures) == 0, failures
 
 
+def check_equation_sequence(
+    labels: List[Tuple[int, str, str, int, str]],
+    ch_num: int,
+    expected_max: int
+) -> Tuple[bool, List[str], Dict[str, Any]]:
+    """
+    Asserts:
+    i.  base numbers run 1..expected_max with no gaps and no duplicate bare definitions
+    ii. for any base number with letter suffixes, letters run from 'a' with no gaps,
+        and that base must NOT also appear bare.
+    """
+    failures = []
+    if not labels:
+        return False, [f"Chapter {ch_num:02d} Equations: No equations found."], {}
+
+    by_num = defaultdict(list)
+    for num, letter, tag, line_no, raw_line in labels:
+        by_num[num].append((letter, tag, line_no))
+
+    unique_bases = sorted(by_num.keys())
+    expected_bases = set(range(1, expected_max + 1))
+    found_bases = set(unique_bases)
+
+    # Check gaps in base numbers
+    missing = sorted(expected_bases - found_bases)
+    if missing:
+        failures.append(f"Chapter {ch_num:02d} Equations: Missing base equation numbers (gaps): {missing}")
+
+    extra = sorted(found_bases - expected_bases)
+    if extra:
+        failures.append(f"Chapter {ch_num:02d} Equations: Unexpected base numbers outside 1..{expected_max}: {extra}")
+
+    # Check duplicate bare and letter contiguity
+    for num, occurrences in sorted(by_num.items()):
+        bare_occurrences = [tag for letter, tag, _ in occurrences if letter == ""]
+        letter_occurrences = [letter for letter, tag, _ in occurrences if letter != ""]
+
+        # If appears both bare and lettered -> FAILURE
+        if bare_occurrences and letter_occurrences:
+            failures.append(
+                f"Chapter {ch_num:02d} Equation {ch_num}.{num}: Appears both bare and lettered (bare {bare_occurrences} and suffixes {sorted(set(letter_occurrences))})"
+            )
+
+        # Duplicate bare definitions
+        if len(bare_occurrences) > 1:
+            failures.append(
+                f"Chapter {ch_num:02d} Equation {ch_num}.{num}: Duplicate bare definition ({len(bare_occurrences)} times)"
+            )
+
+        # Letter suffixes contiguity
+        if letter_occurrences:
+            unique_letters = sorted(set(letter_occurrences))
+            expected_letters = [chr(ord('a') + i) for i in range(len(unique_letters))]
+            if unique_letters != expected_letters:
+                failures.append(
+                    f"Chapter {ch_num:02d} Equation {ch_num}.{num}: Letter suffix gap or does not start at 'a' (found {unique_letters}, expected {expected_letters})"
+                )
+            if len(letter_occurrences) != len(unique_letters):
+                failures.append(
+                    f"Chapter {ch_num:02d} Equation {ch_num}.{num}: Duplicate letter suffix in {letter_occurrences}"
+                )
+
+    stats = {
+        "total_labels": len(labels),
+        "unique_base_equations": len(unique_bases),
+        "min": unique_bases[0] if unique_bases else None,
+        "max": unique_bases[-1] if unique_bases else None,
+        "lettered_base_count": len([n for n, occ in by_num.items() if any(l != "" for l, _, _ in occ)])
+    }
+    return len(failures) == 0, failures, stats
+
+
 def check_equations(chapters_dir: Path) -> Tuple[bool, List[str], Dict[str, Any]]:
-    """Check b) Equation sequence: (2.1)..(2.N) and (3.1)..(3.M) contiguous with no gaps."""
+    """Check b) Equation sequence: (2.1)..(2.141) and (3.1)..(3.154) contiguous with no gaps."""
     failures = []
     stats = {}
 
-    for ch_num, expected_max in [(2, 141), (3, 153)]:
+    for ch_num, expected_max in [(2, 141), (3, 154)]:
         ch_file = chapters_dir / f"chapter_{ch_num:02d}.md"
         if not ch_file.exists():
             failures.append(f"Chapter file {ch_file.name} missing for equation check.")
             continue
         text = ch_file.read_text(encoding="utf-8")
-        base_ints, raw_tags = extract_equation_numbers(text, ch_num)
-        unique_base = sorted(set(base_ints))
+        labels = extract_equation_labels(text, ch_num)
+        ch_passed, ch_fails, ch_stats = check_equation_sequence(labels, ch_num, expected_max)
+        if not ch_passed:
+            failures.extend(ch_fails)
+        stats[f"chapter_{ch_num:02d}_equations"] = ch_stats
 
-        stats[f"chapter_{ch_num:02d}_equations"] = {
-            "total_matches": len(base_ints),
-            "unique_base_equations": len(unique_base),
-            "min": unique_base[0] if unique_base else None,
-            "max": unique_base[-1] if unique_base else None
-        }
+    return len(failures) == 0, failures, stats
 
-        # Assert contiguous from 1 to expected_max
-        expected_set = set(range(1, expected_max + 1))
-        found_set = set(unique_base)
-        missing = sorted(expected_set - found_set)
-        if missing:
-            failures.append(f"Chapter {ch_num:02d} Equations: Gaps detected. Missing {len(missing)} equations: {missing}")
 
+def extract_section_headings(text: str, ch_num: int) -> List[str]:
+    """
+    Extracts section headings for a chapter.
+    Matches headings strictly in heading positions (^#+ ... or list/quote heading indicators).
+    Does NOT match numbers inside parentheses (e.g. (2.75)) or numbers in running text.
+    Stops before exercises/problems.
+    """
+    sections = []
+    seen = set()
+    lines = text.splitlines()
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^#{1,6}\s*(?:Exercises|Problems)\b", stripped, re.IGNORECASE):
+            break
+        # Match markdown headings or backticked/itemized headings
+        m = re.search(rf"(?:^|[`\s])#+\s*(?:Section\s+)?({ch_num}\.\d+(?:\.\d+)*)\b", stripped)
+        if not m:
+            m = re.match(rf"^[-*]\s*(?:Section\s+heading:\s*`?|Section\s+header:\s*`?|Section\s+)?#*\s*({ch_num}\.\d+(?:\.\d+)*)\b", stripped)
+        if m:
+            sec_str = m.group(1)
+            if sec_str not in seen:
+                seen.add(sec_str)
+                sections.append(sec_str)
+    return sections
+
+
+def check_section_hierarchy(
+    sections: List[str],
+    ch_num: int,
+    expected_level1_range: range
+) -> Tuple[bool, List[str], Dict[str, Any]]:
+    """
+    Asserts:
+    Level 1: ch.M runs contiguous 1..max without gaps.
+    Level 2+: subsections under each section run contiguous from 1.
+    """
+    failures = []
+    if not sections:
+        return False, [f"Chapter {ch_num:02d} Sections: No sections found."], {}
+
+    level1_ints = []
+    subsections = defaultdict(set)
+
+    for sec in sections:
+        parts = [int(p) for p in sec.split(".")]
+        if len(parts) >= 2:
+            level1_ints.append(parts[1])
+        if len(parts) >= 3:
+            parent = f"{parts[0]}.{parts[1]}"
+            subsections[parent].add(parts[2])
+
+    # Check level 1 contiguity
+    unique_l1 = sorted(set(level1_ints))
+    expected_l1 = set(expected_level1_range)
+    missing_l1 = sorted(expected_l1 - set(unique_l1))
+    if missing_l1:
+        failures.append(f"Chapter {ch_num:02d} Sections: Missing Level 1 sections: {missing_l1}")
+
+    # Check subsection contiguity (Level 2)
+    for parent, subs in sorted(subsections.items()):
+        sorted_subs = sorted(subs)
+        expected_subs = list(range(1, max(sorted_subs) + 1))
+        if sorted_subs != expected_subs:
+            missing_subs = sorted(set(expected_subs) - subs)
+            failures.append(f"Chapter {ch_num:02d} Subsections under {parent}: Gaps detected (found {sorted_subs}, missing {missing_subs})")
+
+    stats = {
+        "sections_found": unique_l1,
+        "all_headings": sections,
+        "subsections_found": {k: sorted(v) for k, v in subsections.items()}
+    }
     return len(failures) == 0, failures, stats
 
 
@@ -175,8 +352,6 @@ def check_sections_and_figures(chapters_dir: Path) -> Tuple[bool, List[str], Dic
     failures = []
     stats = {}
 
-    # Chapter 2: Sections 2.1 to 2.6; Figures 2.1 to 2.18
-    # Chapter 3: Sections 3.1 to 3.4; Figures 3.1 to 3.14; Table 3.1
     targets = {
         2: {"sections": range(1, 7), "figures": range(1, 19), "tables": []},
         3: {"sections": range(1, 5), "figures": range(1, 15), "tables": [1]}
@@ -189,15 +364,13 @@ def check_sections_and_figures(chapters_dir: Path) -> Tuple[bool, List[str], Dic
             continue
         text = ch_file.read_text(encoding="utf-8")
 
-        # Sections: matches "## Section 2.1" or "## 2.1" or "# 2.1"
-        sec_matches = re.findall(rf'(?:#+\s*(?:Section\s+)?|\bSection\s+){ch_num}\.(\d+)\b', text)
-        sec_ints = sorted(set(int(x) for x in sec_matches))
-        expected_secs = set(tgt["sections"])
-        missing_secs = sorted(expected_secs - set(sec_ints))
-        if missing_secs:
-            failures.append(f"Chapter {ch_num:02d} Sections: Missing section headings: {missing_secs}")
+        # Sections check
+        headings = extract_section_headings(text, ch_num)
+        sec_passed, sec_fails, sec_stats = check_section_hierarchy(headings, ch_num, tgt["sections"])
+        if not sec_passed:
+            failures.extend(sec_fails)
 
-        # Figures: matches "**Figure 2.1**" or "Figure 2.1"
+        # Figures check
         fig_matches = re.findall(rf'Figure\s+{ch_num}\.(\d+)\b', text, re.IGNORECASE)
         fig_ints = sorted(set(int(x) for x in fig_matches))
         expected_figs = set(tgt["figures"])
@@ -205,7 +378,8 @@ def check_sections_and_figures(chapters_dir: Path) -> Tuple[bool, List[str], Dic
         if missing_figs:
             failures.append(f"Chapter {ch_num:02d} Figures: Missing figures: {missing_figs}")
 
-        # Tables: matches "Table 3.1"
+        # Tables check
+        tbl_ints = []
         if tgt["tables"]:
             tbl_matches = re.findall(rf'Table\s+{ch_num}\.(\d+)\b', text, re.IGNORECASE)
             tbl_ints = sorted(set(int(x) for x in tbl_matches))
@@ -215,9 +389,10 @@ def check_sections_and_figures(chapters_dir: Path) -> Tuple[bool, List[str], Dic
                 failures.append(f"Chapter {ch_num:02d} Tables: Missing tables: {missing_tbls}")
 
         stats[f"chapter_{ch_num:02d}_structure"] = {
-            "sections_found": sec_ints,
+            "sections_found": sec_stats.get("sections_found", []),
+            "all_headings": headings,
             "figures_found": fig_ints,
-            "tables_found": sorted(set(int(x) for x in re.findall(rf'Table\s+{ch_num}\.(\d+)\b', text, re.IGNORECASE)))
+            "tables_found": tbl_ints
         }
 
     return len(failures) == 0, failures, stats
@@ -288,7 +463,6 @@ def check_latex_integrity(pages_dir: Path) -> Tuple[bool, List[str], Dict[str, A
         stats["pages_checked"] += 1
 
         # Check balanced $$
-        # Count display math delimiters ($$)
         display_math_count = len(re.findall(r'(?<!\\)\$\$', content))
         if display_math_count % 2 != 0:
             failures.append(f"Page {p} (Book p. {p - 20}): Unbalanced $$ display math delimiter (count={display_math_count})")
@@ -306,8 +480,6 @@ def check_latex_integrity(pages_dir: Path) -> Tuple[bool, List[str], Dict[str, A
                 failures.append(f"Page {p} (Book p. {p - 20}): Corrupted OCR signature found matching '{pattern}': '{match.group(0)}'")
 
         # Check if page begins mid-word
-        # A mid-word beginning typically starts with a hyphen followed by letters (e.g. "-ference")
-        # or non-heading lowercase word without punctuation.
         lines = [line.strip() for line in content.splitlines() if line.strip()]
         if lines:
             first_line = lines[0]
@@ -317,36 +489,262 @@ def check_latex_integrity(pages_dir: Path) -> Tuple[bool, List[str], Dict[str, A
     return len(failures) == 0, failures, stats
 
 
+def check_sub_equation_sweep(
+    pages_dir: Path,
+    in_scope_pages: List[int] = IN_SCOPE_PAGES
+) -> Tuple[bool, List[str], Dict[str, Any]]:
+    """
+    Check g) SUB-EQUATION SWEEP:
+    Independent of sampling, scans every in-scope page's transcription for:
+    1. Pages where the equation labels jump by more than one (within page or across adjacent pages).
+    2. Any label appearing bare that appears lettered elsewhere.
+    Flags all offending pages.
+    """
+    failures = []
+    flagged_pages = set()
+    page_labels: Dict[int, List[Tuple[int, str, str, int, str]]] = {}
+
+    for p in in_scope_pages:
+        page_file = pages_dir / f"page_{p:04d}.md"
+        if not page_file.exists():
+            continue
+        ch = 2 if p in CH2_PAGES else 3
+        text = page_file.read_text(encoding="utf-8")
+        page_labels[p] = extract_equation_labels(text, ch)
+
+    # 1. Collect all base numbers that appear with letter suffixes anywhere
+    lettered_bases: Dict[int, Set[int]] = {2: set(), 3: set()}
+    for p, lbls in page_labels.items():
+        ch = 2 if p in CH2_PAGES else 3
+        for num, letter, tag, line_no, raw in lbls:
+            if letter:
+                lettered_bases[ch].add(num)
+
+    # 2. Check for bare appearances of bases that appear lettered elsewhere
+    for p, lbls in page_labels.items():
+        ch = 2 if p in CH2_PAGES else 3
+        for num, letter, tag, line_no, raw in lbls:
+            if not letter and num in lettered_bases[ch]:
+                flagged_pages.add(p)
+                failures.append(
+                    f"Page {p} (Book p. {p - 20}): Equation {tag} appears bare, but base {ch}.{num} appears with letter suffixes elsewhere."
+                )
+
+    # 3. Check for internal page jumps > 1
+    for p, lbls in page_labels.items():
+        ch = 2 if p in CH2_PAGES else 3
+        if len(lbls) < 2:
+            continue
+        base_seq = [item[0] for item in lbls]
+        for i in range(len(base_seq) - 1):
+            prev = base_seq[i]
+            curr = base_seq[i + 1]
+            if curr - prev > 1:
+                flagged_pages.add(p)
+                failures.append(
+                    f"Page {p} (Book p. {p - 20}): Equation sequence jumps internally on page by {curr - prev} from {ch}.{prev} to {ch}.{curr}."
+                )
+            elif curr < prev:
+                flagged_pages.add(p)
+                failures.append(
+                    f"Page {p} (Book p. {p - 20}): Equation sequence goes backwards internally on page from {ch}.{prev} to {ch}.{curr}."
+                )
+
+    # 4. Check for cross-page jumps > 1 between adjacent pages in same chapter
+    last_p = None
+    last_base = None
+    last_ch = None
+    for p in sorted(page_labels.keys()):
+        lbls = page_labels[p]
+        if not lbls:
+            continue
+        ch = 2 if p in CH2_PAGES else 3
+        first_base = lbls[0][0]
+        if last_ch == ch and last_base is not None:
+            if first_base - last_base > 1:
+                flagged_pages.add(last_p)
+                flagged_pages.add(p)
+                failures.append(
+                    f"Page {p} (Book p. {p - 20}): Cross-page equation jump by {first_base - last_base} from {ch}.{last_base} (Page {last_p}) to {ch}.{first_base}."
+                )
+        last_p = p
+        last_base = lbls[-1][0]
+        last_ch = ch
+
+    stats = {
+        "pages_scanned": len(page_labels),
+        "flagged_pages_count": len(flagged_pages),
+        "flagged_pages": sorted(flagged_pages),
+        "failures_count": len(failures)
+    }
+    return len(failures) == 0, failures, stats
+
+
+def select_stratified_sample(
+    pages_dir: Path,
+    in_scope_pages: List[int] = IN_SCOPE_PAGES,
+    sample_ratio: float = 0.10,
+    dense_ratio: float = 0.50,
+    seed: int = 42
+) -> Tuple[List[int], List[int]]:
+    """
+    Selects sample of in-scope pages stratified by equation count:
+    - Rank in-scope pages by equation count descending
+    - Sample the densest pages preferentially
+    - Sample random pages for an unbiased signal
+    Returns (dense_pages, random_pages).
+    """
+    page_eq_counts = []
+    for p in in_scope_pages:
+        page_file = pages_dir / f"page_{p:04d}.md"
+        ch = 2 if p in CH2_PAGES else 3
+        count = 0
+        if page_file.exists():
+            text = page_file.read_text(encoding="utf-8")
+            count = len(extract_equation_labels(text, ch))
+        page_eq_counts.append((p, count))
+
+    # Rank by count desc, ties broken by page asc
+    page_eq_counts.sort(key=lambda x: (x[1], -x[0]), reverse=True)
+
+    total_sample = max(1, int(round(len(in_scope_pages) * sample_ratio)))
+    dense_count = max(1, int(round(total_sample * dense_ratio)))
+    random_count = total_sample - dense_count
+
+    dense_pages = sorted([p for p, c in page_eq_counts[:dense_count]])
+    remaining_pages = [p for p, c in page_eq_counts[dense_count:]]
+
+    rng = random.Random(seed)
+    random_pages = sorted(rng.sample(remaining_pages, random_count))
+
+    return dense_pages, random_pages
+
+
+def transcribe_image_with_retry(
+    img_path: Path,
+    api_key: str,
+    model: str = "gemma-4-31b-it",
+    timeout: int = 180,
+    max_retries: int = 5,
+    initial_delay: float = 3.0,
+    backoff_factor: float = 2.0
+) -> Tuple[Optional[str], str, Optional[str]]:
+    """
+    Transcribes page image with exponential backoff and timeout >= 180s.
+    Returns (transcription_text, status, failure_reason)
+    Status is 'VERIFIED' (success) or 'UNVERIFIED' (timeout/error).
+    """
+    if not img_path.exists():
+        return None, "UNVERIFIED", f"Image {img_path.name} does not exist"
+
+    with open(img_path, "rb") as f:
+        img_bytes = f.read()
+    b64_data = base64.b64encode(img_bytes).decode("utf-8")
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": TRANSCRIPTION_PROMPT},
+                {"inline_data": {"mime_type": "image/png", "data": b64_data}}
+            ]
+        }],
+        "generationConfig": {"temperature": 0.0}
+    }
+
+    delay = initial_delay
+    last_err = ""
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(url, json=payload, timeout=timeout)
+            if resp.status_code == 200:
+                data = resp.json()
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts:
+                        return clean_markdown_fences(parts[0].get("text", "")), "VERIFIED", None
+                last_err = f"Empty response structure: {data}"
+            elif resp.status_code in (429, 500, 503, 504):
+                last_err = f"HTTP {resp.status_code}"
+                time.sleep(delay)
+                delay *= backoff_factor
+            else:
+                last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                break
+        except requests.exceptions.Timeout:
+            last_err = f"Read timeout (>{timeout}s)"
+            time.sleep(delay)
+            delay *= backoff_factor
+        except Exception as exc:
+            last_err = f"Exception: {exc}"
+            time.sleep(delay)
+            delay *= backoff_factor
+
+    return None, "UNVERIFIED", f"Failed after {max_retries} attempts: {last_err}"
+
+
 def check_cross_model_spot(
     pages_dir: Path,
     sample_ratio: float = 0.10,
     seed: int = 42,
     api_key: Optional[str] = None,
-    cross_model: str = "gemma-4-31b-it"
+    cross_model: str = "gemma-4-31b-it",
+    retranscribe: bool = False,
+    sampled_pages: Optional[List[int]] = None,
+    cross_dir: Path = Path("data/cross_model")
 ) -> Tuple[bool, List[str], Dict[str, Any]]:
     """
     Check f) Cross-Model Spot Check:
-    Re-transcribes a random 10% sample of in-scope pages with a DIFFERENT model family (e.g. gemma-4-31b-it).
-    Asserts agreement on equation numbers present and section headings present.
+    - Classifies three outcomes separately: AGREE, DISAGREE, UNVERIFIED.
+    - A timeout is recorded as UNVERIFIED (never DISAGREE or AGREE).
+    - Any page left UNVERIFIED is a coverage failure.
+    - Reports achieved coverage percentage vs target.
+    - Evaluates dense and random groups separately.
+    - Re-transcribes nothing by default (inspects cached results in data/cross_model).
     """
     failures = []
-    stats = {}
-    key = api_key or DEFAULT_API_KEY
-    if not key:
-        return False, ["Cross-model spot check requires GEMINI_API_KEY."], {}
-
-    random.seed(seed)
-    sample_size = max(1, int(len(IN_SCOPE_PAGES) * sample_ratio))
-    sampled_pages = sorted(random.sample(IN_SCOPE_PAGES, sample_size))
-
-    cross_dir = Path("data/cross_model")
     cross_dir.mkdir(parents=True, exist_ok=True)
     images_dir = Path("data/page_images")
 
-    print(f"\n--- Running Cross-Model Spot Check on {len(sampled_pages)} pages ({sampled_pages}) with model '{cross_model}' ---")
-    spot_results = []
+    # Determine sample
+    if sampled_pages is not None:
+        all_sampled = sorted(sampled_pages)
+        # Classify by equation density
+        page_counts = []
+        for p in all_sampled:
+            pf = pages_dir / f"page_{p:04d}.md"
+            ch = 2 if p in CH2_PAGES else 3
+            cnt = len(extract_equation_labels(pf.read_text(), ch)) if pf.exists() else 0
+            page_counts.append((p, cnt))
+        page_counts.sort(key=lambda x: (x[1], -x[0]), reverse=True)
+        dense_pages = sorted([p for p, c in page_counts[:len(all_sampled)//2]])
+        random_pages = sorted([p for p in all_sampled if p not in dense_pages])
+    elif not retranscribe:
+        # Default diagnostic run: evaluate the established 9-page sample
+        all_sampled = sorted(DEFAULT_SPOT_SAMPLE)
+        # Dense vs random partition of the established sample based on equation count
+        # High equation pages: 46 (8), 50 (8), 119 (8), 36 (7), 61 (4)
+        # Low/unbiased pages: 64 (2), 47 (0), 68 (0), 114 (0)
+        dense_pages = [36, 46, 50, 61, 119]
+        random_pages = [47, 64, 68, 114]
+    else:
+        dense_pages, random_pages = select_stratified_sample(
+            pages_dir, IN_SCOPE_PAGES, sample_ratio=sample_ratio, seed=seed
+        )
+        all_sampled = sorted(dense_pages + random_pages)
 
-    for p in sampled_pages:
+    target_coverage_pct = (len(all_sampled) / len(IN_SCOPE_PAGES)) * 100.0
+
+    print(f"\n--- Cross-Model Spot Check: {len(all_sampled)} pages total (Dense: {dense_pages}, Random: {random_pages}) ---")
+
+    spot_results = []
+    agreed_count = 0
+    disagreed_count = 0
+    unverified_count = 0
+
+    for p in all_sampled:
+        group = "dense" if p in dense_pages else "random"
         page_key = f"page_{p:04d}"
         primary_file = pages_dir / f"{page_key}.md"
         cross_file = cross_dir / f"{page_key}_cross.md"
@@ -354,61 +752,110 @@ def check_cross_model_spot(
 
         if not primary_file.exists():
             failures.append(f"Page {p}: Primary transcription missing for spot check.")
+            spot_results.append({
+                "page": p,
+                "book_page": p - 20,
+                "group": group,
+                "status": "UNVERIFIED",
+                "reason": "Primary transcription missing"
+            })
+            unverified_count += 1
             continue
-        primary_text = primary_file.read_text(encoding="utf-8")
 
-        # Load or generate cross-model transcription
+        primary_text = primary_file.read_text(encoding="utf-8")
+        ch_num = 2 if p in CH2_PAGES else 3
+
+        # Check cached cross-transcription or retranscribe
+        cross_text = None
+        unverified_reason = None
         if cross_file.exists() and len(cross_file.read_text(encoding="utf-8").strip()) > 0:
             cross_text = cross_file.read_text(encoding="utf-8")
-            print(f"Loaded cached cross-transcription for {page_key}...")
+        elif retranscribe:
+            key = api_key or DEFAULT_API_KEY
+            if not key:
+                unverified_reason = "No API key available for re-transcription"
+            else:
+                cross_text, status, err = transcribe_image_with_retry(img_path, key, model=cross_model)
+                if cross_text:
+                    cross_file.write_text(cross_text, encoding="utf-8")
+                else:
+                    unverified_reason = err
         else:
-            print(f"Transcribing {page_key} with {cross_model}...")
-            try:
-                cross_text = transcribe_page_image(img_path, api_key=key, model=cross_model)
-                cross_file.write_text(cross_text, encoding="utf-8")
-            except Exception as e:
-                failures.append(f"Page {p}: Cross-model transcription failed: {e}")
-                continue
+            unverified_reason = "Cross-transcription not cached / timed out in previous run"
 
-        ch_num = 2 if p in CH2_PAGES else 3
-        # Extract equation numbers from both
-        _, primary_eqs = extract_equation_numbers(primary_text, ch_num)
-        _, cross_eqs = extract_equation_numbers(cross_text, ch_num)
+        if cross_text is None:
+            spot_results.append({
+                "page": p,
+                "book_page": p - 20,
+                "group": group,
+                "status": "UNVERIFIED",
+                "reason": unverified_reason
+            })
+            unverified_count += 1
+            continue
 
-        primary_eq_set = set(primary_eqs)
-        cross_eq_set = set(cross_eqs)
+        # Both transcriptions present: compare equations and section headings
+        primary_eq_labels = extract_equation_labels(primary_text, ch_num)
+        cross_eq_labels = extract_equation_labels(cross_text, ch_num)
+        primary_eqs = sorted(set(item[2] for item in primary_eq_labels))
+        cross_eqs = sorted(set(item[2] for item in cross_eq_labels))
 
-        # Extract section headings
-        primary_secs = set(re.findall(rf'{ch_num}\.(\d+)', primary_text))
-        cross_secs = set(re.findall(rf'{ch_num}\.(\d+)', cross_text))
+        primary_secs = sorted(set(extract_section_headings(primary_text, ch_num)))
+        cross_secs = sorted(set(extract_section_headings(cross_text, ch_num)))
 
-        eq_diff = primary_eq_set.symmetric_difference(cross_eq_set)
-        sec_diff = primary_secs.symmetric_difference(cross_secs)
+        eq_diff = sorted(set(primary_eqs).symmetric_difference(set(cross_eqs)))
+        sec_diff = sorted(set(primary_secs).symmetric_difference(set(cross_secs)))
 
-        match = (len(eq_diff) == 0 and len(sec_diff) == 0)
+        if not eq_diff and not sec_diff:
+            status = "AGREE"
+            agreed_count += 1
+        else:
+            status = "DISAGREE"
+            disagreed_count += 1
+            msg = f"Page {p} (Book p. {p - 20}): Cross-model disagreement!\n"
+            if eq_diff:
+                msg += f"  Equation differences: primary={primary_eqs}, cross={cross_eqs}, diff={eq_diff}\n"
+            if sec_diff:
+                msg += f"  Section differences: primary={primary_secs}, cross={cross_secs}, diff={sec_diff}"
+            failures.append(msg)
+
         spot_results.append({
             "page": p,
             "book_page": p - 20,
-            "primary_eqs": sorted(primary_eq_set),
-            "cross_eqs": sorted(cross_eq_set),
-            "primary_secs": sorted(primary_secs),
-            "cross_secs": sorted(cross_secs),
-            "match": match
+            "group": group,
+            "status": status,
+            "primary_eqs": primary_eqs,
+            "cross_eqs": cross_eqs,
+            "primary_secs": primary_secs,
+            "cross_secs": cross_secs,
+            "eq_diff": eq_diff,
+            "sec_diff": sec_diff
         })
 
-        if not match:
-            msg = f"Page {p} (Book p. {p - 20}): Cross-model disagreement!\n"
-            if eq_diff:
-                msg += f"  Equation differences: primary={sorted(primary_eq_set)}, cross={sorted(cross_eq_set)}, diff={sorted(eq_diff)}\n"
-            if sec_diff:
-                msg += f"  Section differences: primary={sorted(primary_secs)}, cross={sorted(cross_secs)}, diff={sorted(sec_diff)}"
-            failures.append(msg)
+    # Coverage calculations
+    verified_count = agreed_count + disagreed_count
+    achieved_coverage_pct = (verified_count / len(IN_SCOPE_PAGES)) * 100.0
 
-    stats["spot_results"] = spot_results
-    stats["sampled_pages"] = sampled_pages
-    stats["cross_model"] = cross_model
+    if unverified_count > 0:
+        unverified_pages = [r["page"] for r in spot_results if r["status"] == "UNVERIFIED"]
+        failures.append(
+            f"Cross-model check: Coverage failure. Achieved {achieved_coverage_pct:.1f}% ({verified_count}/{len(IN_SCOPE_PAGES)} pages) vs target {target_coverage_pct:.1f}%. "
+            f"{unverified_count} page(s) left UNVERIFIED: {unverified_pages}"
+        )
 
-    return len(failures) == 0, failures, stats
+    stats = {
+        "sampled_pages": all_sampled,
+        "dense_group": dense_pages,
+        "random_group": random_pages,
+        "target_coverage_pct": round(target_coverage_pct, 1),
+        "achieved_coverage_pct": round(achieved_coverage_pct, 1),
+        "agreed_count": agreed_count,
+        "disagreed_count": disagreed_count,
+        "unverified_count": unverified_count,
+        "results": spot_results
+    }
+
+    return (len(failures) == 0 and unverified_count == 0), failures, stats
 
 
 def generate_verification_report(
@@ -418,6 +865,7 @@ def generate_verification_report(
     problems_res: Tuple[bool, List[str], Dict[str, Any]],
     latex_res: Tuple[bool, List[str], Dict[str, Any]],
     cross_res: Tuple[bool, List[str], Dict[str, Any]],
+    sweep_res: Tuple[bool, List[str], Dict[str, Any]],
     output_path: Path
 ) -> str:
     """Generates comprehensive verification report markdown."""
@@ -427,7 +875,8 @@ def generate_verification_report(
         sections_res[0],
         problems_res[0],
         latex_res[0],
-        cross_res[0]
+        cross_res[0],
+        sweep_res[0]
     ])
 
     lines = [
@@ -444,11 +893,12 @@ def generate_verification_report(
         f"| Check | Description | Status |",
         f"| :--- | :--- | :--- |",
         f"| a) Completeness | Checkpoint presence & non-empty character threshold | {'PASS' if completeness_res[0] else 'FAIL'} |",
-        f"| b) Equation Sequence | Contiguous equations with no gaps or duplicates | {'PASS' if equations_res[0] else 'FAIL'} |",
-        f"| c) Section / Figure / Table | Contiguous structure hierarchy | {'PASS' if sections_res[0] else 'FAIL'} |",
+        f"| b) Equation Sequence | Contiguous equations with no gaps, duplicates, or bare/letter conflicts | {'PASS' if equations_res[0] else 'FAIL'} |",
+        f"| c) Section / Figure / Table | Contiguous structure hierarchy (sections & subsections) | {'PASS' if sections_res[0] else 'FAIL'} |",
         f"| d) Problem Sequence | Contiguous end-of-chapter problems | {'PASS' if problems_res[0] else 'FAIL'} |",
         f"| e) LaTeX & OCR Integrity | Balanced delimiters, no corrupted OCR artifacts | {'PASS' if latex_res[0] else 'FAIL'} |",
-        f"| f) Cross-Model Spot Check | 10% sample dual-model verification | {'PASS' if cross_res[0] else 'FAIL'} |",
+        f"| f) Cross-Model Spot Check | Dual-model verification (AGREE / DISAGREE / UNVERIFIED, coverage %) | {'PASS' if cross_res[0] else 'FAIL'} |",
+        f"| g) Sub-Equation Sweep | Full scan for equation jumps > 1 and bare/lettered conflicts | {'PASS' if sweep_res[0] else 'FAIL'} |",
         "",
         "---",
         "",
@@ -463,6 +913,7 @@ def generate_verification_report(
         ("d) Problem Sequence", problems_res),
         ("e) LaTeX & OCR Integrity", latex_res),
         ("f) Cross-Model Spot Check", cross_res),
+        ("g) Sub-Equation Sweep", sweep_res),
     ]
 
     for name, res in checks:
@@ -472,7 +923,8 @@ def generate_verification_report(
         if fails:
             lines.append("- **Failures:**")
             for f in fails:
-                lines.append(f"  - {f}")
+                for sub_line in f.splitlines():
+                    lines.append(f"  - {sub_line}" if not sub_line.startswith("  ") else sub_line)
         else:
             lines.append("- **Details:** All assertions satisfied.")
         if stats:
@@ -490,43 +942,48 @@ def run_verification(
     chapters_dir: Path = Path("data/chapters"),
     problems_dir: Path = Path("data/problems"),
     report_path: Path = Path("data/verification_report.md"),
-    api_key: Optional[str] = None
+    api_key: Optional[str] = None,
+    retranscribe: bool = False
 ) -> int:
     """Executes all verification checks and exits non-zero on failure."""
     print("=" * 60)
     print("LEARN-ASSIST STAGE 1 VERIFICATION")
     print("=" * 60)
 
-    print("\n[1/6] Verifying a) Completeness...")
+    print("\n[1/7] Verifying a) Completeness...")
     comp_res = check_completeness(pages_dir)
     print(f"  -> {'PASS' if comp_res[0] else 'FAIL'}")
 
-    print("\n[2/6] Verifying b) Equation Sequence...")
+    print("\n[2/7] Verifying b) Equation Sequence...")
     eq_res = check_equations(chapters_dir)
     print(f"  -> {'PASS' if eq_res[0] else 'FAIL'}")
 
-    print("\n[3/6] Verifying c) Section, Figure, and Table Sequence...")
+    print("\n[3/7] Verifying c) Section, Figure, and Table Sequence...")
     sec_res = check_sections_and_figures(chapters_dir)
     print(f"  -> {'PASS' if sec_res[0] else 'FAIL'}")
 
-    print("\n[4/6] Verifying d) Problem Sequence...")
+    print("\n[4/7] Verifying d) Problem Sequence...")
     prob_res = check_problem_sequence(problems_dir)
     print(f"  -> {'PASS' if prob_res[0] else 'FAIL'}")
 
-    print("\n[5/6] Verifying e) LaTeX Integrity & Corrupted OCR Signatures...")
+    print("\n[5/7] Verifying e) LaTeX Integrity & Corrupted OCR Signatures...")
     latex_res = check_latex_integrity(pages_dir)
     print(f"  -> {'PASS' if latex_res[0] else 'FAIL'}")
 
-    print("\n[6/6] Verifying f) Cross-Model Spot Check (10% sample)...")
-    cross_res = check_cross_model_spot(pages_dir, api_key=api_key)
+    print("\n[6/7] Verifying f) Cross-Model Spot Check...")
+    cross_res = check_cross_model_spot(pages_dir, api_key=api_key, retranscribe=retranscribe)
     print(f"  -> {'PASS' if cross_res[0] else 'FAIL'}")
 
+    print("\n[7/7] Verifying g) Sub-Equation Sweep (93 pages)...")
+    sweep_res = check_sub_equation_sweep(pages_dir)
+    print(f"  -> {'PASS' if sweep_res[0] else 'FAIL'}")
+
     report = generate_verification_report(
-        comp_res, eq_res, sec_res, prob_res, latex_res, cross_res, report_path
+        comp_res, eq_res, sec_res, prob_res, latex_res, cross_res, sweep_res, report_path
     )
 
     all_passed = all([
-        comp_res[0], eq_res[0], sec_res[0], prob_res[0], latex_res[0], cross_res[0]
+        comp_res[0], eq_res[0], sec_res[0], prob_res[0], latex_res[0], cross_res[0], sweep_res[0]
     ])
 
     print("\n" + "=" * 60)
@@ -547,6 +1004,7 @@ def main():
     parser.add_argument("--problems-dir", type=Path, default=Path("data/problems"), help="Problems directory")
     parser.add_argument("--report", type=Path, default=Path("data/verification_report.md"), help="Report output path")
     parser.add_argument("--api-key", type=str, default=None, help="API key for cross-model spot check")
+    parser.add_argument("--retranscribe", action="store_true", default=False, help="Enable API re-transcription of uncached spot check pages")
     args = parser.parse_args()
 
     exit_code = run_verification(
@@ -554,7 +1012,8 @@ def main():
         chapters_dir=args.chapters_dir,
         problems_dir=args.problems_dir,
         report_path=args.report,
-        api_key=args.api_key
+        api_key=args.api_key,
+        retranscribe=args.retranscribe
     )
     sys.exit(exit_code)
 
