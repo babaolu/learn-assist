@@ -2,6 +2,20 @@
 book/
 data/
 
+# Legacy book2Lecture data — present on some clones, never commit
+books/
+output_lectures/
+graphify-out/
+
+# Generated audio
+*.mp3
+*.wav
+*.m4a
+*.flac
+
+# Logs
+*.log
+
 # Python Virtual Environment & Caches
 .venv/
 venv/
@@ -33,12 +47,18 @@ images_cache/
 .cache/
 cache/
 *_cache/
-*.png
-*.jpg
-*.jpeg
-*.tiff
-*.bmp
-*.webp
+*_cache/*.png
+*_cache/*.jpg
+*_cache/*.jpeg
+*_cache/*.tiff
+*_cache/*.bmp
+*_cache/*.webp
+page_images/*.png
+page_images/*.jpg
+page_images/*.jpeg
+page_images/*.tiff
+page_images/*.bmp
+page_images/*.webp
 
 # OS and Editor files
 .DS_Store
