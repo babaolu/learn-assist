@@ -90,16 +90,20 @@ def clean_markdown_fences(text: str) -> str:
 
 def transcribe_page_image(
     image_path: Path,
-    api_key: str,
+    api_key: Optional[str] = None,
     model: str = DEFAULT_MODEL,
     max_retries: int = 5,
     backoff_factor: float = 2.0,
 ) -> str:
     """Calls the vision model to transcribe the page image with retries on rate limits."""
+    key = api_key or DEFAULT_API_KEY
+    if not key:
+        raise ValueError("GEMINI_API_KEY is not set. Please set the GEMINI_API_KEY environment variable or provide --api-key.")
+
     with open(image_path, "rb") as img_file:
         img_b64 = base64.b64encode(img_file.read()).decode("utf-8")
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
     payload = {
         "contents": [{
             "parts": [
@@ -155,7 +159,7 @@ def run_ingestion(
     """Runs the resumable ingestion pipeline over the specified page range."""
     key = api_key or DEFAULT_API_KEY
     if not key:
-        raise ValueError("No Gemini API key provided. Set GEMINI_API_KEY environment variable.")
+        raise ValueError("GEMINI_API_KEY is not set. Please set the GEMINI_API_KEY environment variable or pass --api-key.")
 
     book_dir = Path("book")
     source_pdf = pdf_path or find_source_pdf(book_dir)

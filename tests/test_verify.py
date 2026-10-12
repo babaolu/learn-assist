@@ -486,3 +486,40 @@ def test_pdf_text_layer_coverage_warns_when_missing_in_pdf(tmp_path: Path):
     assert stats["warning_pages"] == [33]
     assert any("2.1" in w for w in stats["warnings"])
 
+
+def test_unset_api_key_raises_error(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    import learn_assist.ingest as imod
+    import learn_assist.verify as vmod
+    monkeypatch.setattr(imod, "DEFAULT_API_KEY", None)
+    monkeypatch.setattr(vmod, "DEFAULT_API_KEY", None)
+
+    dummy_img = tmp_path / "test.png"
+    dummy_img.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    # transcribe_page_image fails
+    with pytest.raises(ValueError, match="GEMINI_API_KEY is not set"):
+        imod.transcribe_page_image(dummy_img, api_key=None)
+
+    # run_ingestion fails
+    with pytest.raises(ValueError, match="GEMINI_API_KEY is not set"):
+        imod.run_ingestion(api_key=None)
+
+    # transcribe_image_with_retry fails
+    with pytest.raises(ValueError, match="GEMINI_API_KEY is not set"):
+        vmod.transcribe_image_with_retry(dummy_img, api_key=None)
+
+    # check_cross_model_spot with retranscribe=True fails
+    pages_dir = tmp_path / "pages"
+    pages_dir.mkdir()
+    (pages_dir / "page_0036.md").write_text("dummy")
+    with pytest.raises(ValueError, match="GEMINI_API_KEY is not set"):
+        vmod.check_cross_model_spot(
+            pages_dir=pages_dir,
+            sampled_pages=[36],
+            retranscribe=True,
+            api_key=None,
+            cross_dir=tmp_path / "cross"
+        )
+
+

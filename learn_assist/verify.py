@@ -741,7 +741,7 @@ def select_stratified_sample(
 
 def transcribe_image_with_retry(
     img_path: Path,
-    api_key: str,
+    api_key: Optional[str] = None,
     model: str = "gemma-4-31b-it",
     timeout: int = 180,
     max_retries: int = 5,
@@ -753,6 +753,10 @@ def transcribe_image_with_retry(
     Returns (transcription_text, status, failure_reason)
     Status is 'VERIFIED' (success) or 'UNVERIFIED' (timeout/error).
     """
+    key = api_key or DEFAULT_API_KEY
+    if not key:
+        raise ValueError("GEMINI_API_KEY is not set. Please set the GEMINI_API_KEY environment variable or pass --api-key.")
+
     if not img_path.exists():
         return None, "UNVERIFIED", f"Image {img_path.name} does not exist"
 
@@ -760,7 +764,7 @@ def transcribe_image_with_retry(
         img_bytes = f.read()
     b64_data = base64.b64encode(img_bytes).decode("utf-8")
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
     payload = {
         "contents": [{
             "parts": [
@@ -897,13 +901,12 @@ def check_cross_model_spot(
         elif retranscribe:
             key = api_key or DEFAULT_API_KEY
             if not key:
-                unverified_reason = "No API key available for re-transcription"
+                raise ValueError("GEMINI_API_KEY is not set. Please set the GEMINI_API_KEY environment variable or pass --api-key to retranscribe.")
+            cross_text, status, err = transcribe_image_with_retry(img_path, key, model=cross_model)
+            if cross_text:
+                cross_file.write_text(cross_text, encoding="utf-8")
             else:
-                cross_text, status, err = transcribe_image_with_retry(img_path, key, model=cross_model)
-                if cross_text:
-                    cross_file.write_text(cross_text, encoding="utf-8")
-                else:
-                    unverified_reason = err
+                unverified_reason = err
         else:
             unverified_reason = "Cross-transcription not cached / timed out in previous run"
 
