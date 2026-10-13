@@ -50,6 +50,7 @@ from learn_assist.anchors import (
     derive_all_anchors,
     extract_pdf_equation_labels,
 )
+from learn_assist.crosscheck import labelled_equations, norm
 
 MIN_CHAR_THRESHOLD = 150
 DEFAULT_REFERENCE_PATH = Path("anchors/liang_lauterbur.json")
@@ -356,6 +357,9 @@ def extract_section_headings(text: str, ch_num: int) -> List[str]:
         stripped = line.strip()
         if re.match(r"^#{1,6}\s*(?:Exercises|Problems)\b", stripped, re.IGNORECASE):
             break
+        # Skip running heads like "## Section 2.1 Vectors"
+        if re.match(r"^#{1,6}\s*Section\s+\d", stripped, re.IGNORECASE):
+            continue
         m = re.search(rf"(?:^|[`\s])#+\s*(?:Section\s+)?({ch_num}\.\d+(?:\.\d+)*)\b", stripped)
         if not m:
             m = re.match(rf"^[-*]\s*(?:Section\s+heading:\s*`?|Section\s+header:\s*`?|Section\s+)?#*\s*({ch_num}\.\d+(?:\.\d+)*)\b", stripped)
@@ -900,7 +904,7 @@ def select_stratified_sample(
 def transcribe_image_with_retry(
     img_path: Path,
     api_key: Optional[str] = None,
-    model: str = "gemma-4-31b-it",
+    model: str = "claude-opus-5-5",
     timeout: int = 180,
     max_retries: int = 5,
     initial_delay: float = 3.0,
@@ -966,22 +970,23 @@ def check_cross_model_spot(
     sample_ratio: float = 0.10,
     seed: int = 42,
     api_key: Optional[str] = None,
-    cross_model: str = "gemma-4-31b-it",
+    cross_model: Optional[str] = None,
     retranscribe: bool = False,
     sampled_pages: Optional[List[int]] = None,
     cross_dir: Path = Path("data/cross_model"),
     pdf_path: Optional[Path] = None,
     in_scope_pages: Optional[List[int]] = None,
     chapters_meta: Optional[Dict[int, Dict[str, Any]]] = None,
-    primary_vendor: str = "google"
+    primary_vendor: str = "Google"
 ) -> Tuple[bool, List[str], Dict[str, Any]]:
     """
     Check g) Cross-Model Spot Check:
-    - Default path uses text-layer-stratified sampling (Requirement 5a).
-    - Reads vendor and model id from data/cross_model/manifest.json.
-    - Rejects cross-transcriptions from the same vendor as primary (e.g. Gemma & Gemini both Google) (Requirement 6).
-    - Classifies three outcomes: AGREE, DISAGREE, UNVERIFIED.
-    - Unverified pages fail on coverage.
+    - When manifest.json exists, takes sampled pages from 'pages' keys and
+      cross model / vendor from 'cross_model' block.
+    - Fails if cross model vendor matches primary vendor (Google).
+    - Compares equation bodies via crosscheck (labelled_equations, norm) and label sets.
+    - Excuses equation differ if adjudication.json has 'layout_only' or 'ambiguous_print'.
+    - Tracks per-page equation counts (match / notation_only / differ).
     """
     if chapters_meta is None:
         ref_ch, _, _ = load_chapter_metadata()
@@ -999,8 +1004,36 @@ def check_cross_model_spot(
     if cross_manifest_path.exists():
         try:
             cross_manifest = json.loads(cross_manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as e:
+            failures.append(f"Failed to read {cross_manifest_path}: {e}")
+
+    # Load adjudication if present
+    adjudication_path = cross_dir / "adjudication.json"
+    verdicts_map: Dict[Tuple[str, str], str] = {}
+    if adjudication_path.exists():
+        try:
+            adj_data = json.loads(adjudication_path.read_text(encoding="utf-8"))
+            for v in adj_data.get("verdicts", []):
+                p_val = str(v.get("page", ""))
+                lab_val = str(v.get("label", ""))
+                verdict = v.get("verdict", "")
+                if p_val and lab_val:
+                    pk = p_val if p_val.startswith("page_") else f"page_{int(p_val):04d}"
+                    verdicts_map[(pk, lab_val)] = verdict
+        except Exception as e:
+            failures.append(f"Failed to read {adjudication_path}: {e}")
+
+    # Determine cross vendor and model
+    cm_block = cross_manifest.get("cross_model", {}) if isinstance(cross_manifest, dict) else {}
+    cross_vendor = cm_block.get("vendor", "")
+    cross_model_id = cm_block.get("model", "")
+    if not cross_vendor and isinstance(cross_manifest, dict):
+        for val in cross_manifest.values():
+            if isinstance(val, dict) and "vendor" in val:
+                cross_vendor = val["vendor"]
+                cross_model_id = cross_model_id or val.get("model", "")
+                break
+    effective_model = cross_model or cross_model_id or "claude-opus-5-5"
 
     source_pdf = pdf_path or find_source_pdf(Path("book"))
     pdf_doc = pymupdf.open(source_pdf) if (source_pdf and source_pdf.exists()) else None
@@ -1008,20 +1041,9 @@ def check_cross_model_spot(
     # Determine sample
     if sampled_pages is not None:
         all_sampled = sorted(sampled_pages)
-        page_counts = []
-        for p in all_sampled:
-            ch = get_chapter_for_page(p, chapters_meta) or 2
-            if pdf_doc:
-                cnt = len(extract_pdf_text_labels(pdf_doc[p - 1].get_text(), ch))
-            else:
-                pf = pages_dir / f"page_{p:04d}.md"
-                cnt = len(extract_equation_labels(pf.read_text(), ch)) if pf.exists() else 0
-            page_counts.append((p, cnt))
-        page_counts.sort(key=lambda x: (x[1], -x[0]), reverse=True)
-        dense_pages = sorted([p for p, c in page_counts[:len(all_sampled)//2]])
-        random_pages = sorted([p for p in all_sampled if p not in dense_pages])
+    elif cross_manifest and "pages" in cross_manifest:
+        all_sampled = sorted(int(k.replace("page_", "")) for k in cross_manifest["pages"].keys())
     else:
-        # Default stratified selection (Requirement 5a)
         dense_pages, random_pages = select_stratified_sample(
             pages_dir,
             pdf_path=source_pdf,
@@ -1034,7 +1056,58 @@ def check_cross_model_spot(
 
     target_coverage_pct = (len(all_sampled) / len(in_scope_pages)) * 100.0 if in_scope_pages else 0.0
 
-    print(f"\n--- Cross-Model Spot Check: {len(all_sampled)} pages total (Dense: {dense_pages}, Random: {random_pages}) ---")
+    # Fail if cross model vendor matches primary vendor
+    if cross_manifest and cross_vendor:
+        if cross_vendor.strip().lower() == primary_vendor.strip().lower():
+            fail_msg = (
+                f"Cross-model check: Cross model vendor '{cross_vendor}' matches primary vendor '{primary_vendor}'. "
+                f"DESIGN.md requires independent models from different families."
+            )
+            failures.append(fail_msg)
+            stats = {
+                "cross_vendor": cross_vendor,
+                "cross_model": effective_model,
+                "sampled_pages": all_sampled,
+                "dense_group": [],
+                "random_group": [],
+                "target_coverage_pct": round(target_coverage_pct, 1),
+                "achieved_coverage_pct": 0.0,
+                "agreed_count": 0,
+                "disagreed_count": 0,
+                "unverified_count": len(all_sampled),
+                "total_match": 0,
+                "total_notation_only": 0,
+                "total_differ": 0,
+                "results": [
+                    {
+                        "page": p,
+                        "group": "sampled",
+                        "status": "UNVERIFIED",
+                        "vendor": cross_vendor,
+                        "model": effective_model,
+                        "eq_counts": {"match": 0, "notation_only": 0, "differ": 0},
+                        "reason": f"Cross-transcription vendor '{cross_vendor}' matches primary vendor '{primary_vendor}'"
+                    }
+                    for p in all_sampled
+                ]
+            }
+            return False, failures, stats
+
+    # Classify sampled into dense / random for reporting
+    page_counts = []
+    for p in all_sampled:
+        ch = get_chapter_for_page(p, chapters_meta) or 2
+        if pdf_doc:
+            cnt = len(extract_pdf_text_labels(pdf_doc[p - 1].get_text(), ch))
+        else:
+            pf = pages_dir / f"page_{p:04d}.md"
+            cnt = len(extract_equation_labels(pf.read_text(), ch)) if pf.exists() else 0
+        page_counts.append((p, cnt))
+    page_counts.sort(key=lambda x: (x[1], -x[0]), reverse=True)
+    dense_pages = sorted([p for p, c in page_counts[:len(all_sampled)//2]])
+    random_pages = sorted([p for p in all_sampled if p not in dense_pages])
+
+    print(f"\n--- Cross-Model Spot Check: {len(all_sampled)} pages total (Vendor: {cross_vendor or 'unknown'}, Model: {effective_model}) ---")
 
     spot_results = []
     agreed_count = 0
@@ -1046,6 +1119,8 @@ def check_cross_model_spot(
         page_key = f"page_{p:04d}"
         primary_file = pages_dir / f"{page_key}.md"
         cross_file = cross_dir / f"{page_key}_cross.md"
+        if not cross_file.exists():
+            cross_file = cross_dir / f"{page_key}.md"
         img_path = images_dir / f"{page_key}.png"
 
         if not primary_file.exists():
@@ -1054,6 +1129,9 @@ def check_cross_model_spot(
                 "page": p,
                 "group": group,
                 "status": "UNVERIFIED",
+                "vendor": cross_vendor or "unknown",
+                "model": effective_model,
+                "eq_counts": {"match": 0, "notation_only": 0, "differ": 0},
                 "reason": "Primary transcription missing"
             })
             unverified_count += 1
@@ -1062,28 +1140,16 @@ def check_cross_model_spot(
         primary_text = primary_file.read_text(encoding="utf-8")
         ch_num = get_chapter_for_page(p, chapters_meta) or 2
 
-        # Check vendor from manifest (Requirement 6)
-        page_manifest_entry = cross_manifest.get(page_key, {})
-        cross_vendor = page_manifest_entry.get("vendor", "")
-        cross_model_id = page_manifest_entry.get("model", "")
-
         cross_text = None
         unverified_reason = None
 
         if cross_file.exists() and len(cross_file.read_text(encoding="utf-8").strip()) > 0:
-            if cross_vendor.lower() == primary_vendor.lower():
-                # Cross-transcription from same vendor stops counting toward coverage
-                unverified_reason = (
-                    f"Cross-transcription vendor '{cross_vendor}' ({cross_model_id}) matches primary vendor "
-                    f"'{primary_vendor}'; DESIGN.md requires different model family"
-                )
-            else:
-                cross_text = cross_file.read_text(encoding="utf-8")
+            cross_text = cross_file.read_text(encoding="utf-8")
         elif retranscribe:
             key = api_key or DEFAULT_API_KEY
             if not key:
                 raise ValueError("GEMINI_API_KEY is not set. Please set the GEMINI_API_KEY environment variable or pass --api-key to retranscribe.")
-            cross_text, status, err = transcribe_image_with_retry(img_path, key, model=cross_model)
+            cross_text, status, err = transcribe_image_with_retry(img_path, key, model=effective_model)
             if cross_text:
                 cross_file.write_text(cross_text, encoding="utf-8")
             else:
@@ -1097,49 +1163,80 @@ def check_cross_model_spot(
                 "group": group,
                 "status": "UNVERIFIED",
                 "vendor": cross_vendor or "unknown",
-                "model": cross_model_id or "unknown",
+                "model": effective_model,
+                "eq_counts": {"match": 0, "notation_only": 0, "differ": 0},
                 "reason": unverified_reason
             })
             unverified_count += 1
             continue
 
-        # Compare transcriptions
+        # 1. Compare label sets
         primary_eq_labels = extract_equation_labels(primary_text, ch_num)
         cross_eq_labels = extract_equation_labels(cross_text, ch_num)
         primary_eqs = sorted(set(item[2] for item in primary_eq_labels))
         cross_eqs = sorted(set(item[2] for item in cross_eq_labels))
+        eq_diff = sorted(set(primary_eqs).symmetric_difference(set(cross_eqs)))
 
+        # 2. Compare section headings
         primary_secs = sorted(set(extract_section_headings(primary_text, ch_num)))
         cross_secs = sorted(set(extract_section_headings(cross_text, ch_num)))
-
-        eq_diff = sorted(set(primary_eqs).symmetric_difference(set(cross_eqs)))
         sec_diff = sorted(set(primary_secs).symmetric_difference(set(cross_secs)))
 
-        if not eq_diff and not sec_diff:
+        # 3. Compare equation bodies via crosscheck
+        pe_dict = labelled_equations(primary_text)
+        ce_dict = labelled_equations(cross_text)
+        shared_labels = sorted(set(pe_dict.keys()) & set(ce_dict.keys()))
+
+        eq_counts = {"match": 0, "notation_only": 0, "differ": 0}
+        differing_labels = []
+
+        for lab in shared_labels:
+            cs = norm(ce_dict[lab], False)
+            ps = norm(pe_dict[lab], False)
+            cl = norm(ce_dict[lab], True)
+            pl = norm(pe_dict[lab], True)
+
+            if cs == ps:
+                eq_counts["match"] += 1
+            elif cl == pl:
+                eq_counts["notation_only"] += 1
+            else:
+                verdict = verdicts_map.get((page_key, lab)) or verdicts_map.get((str(p), lab))
+                if verdict in ("layout_only", "ambiguous_print"):
+                    eq_counts["notation_only"] += 1
+                else:
+                    eq_counts["differ"] += 1
+                    differing_labels.append(lab)
+
+        if not eq_diff and not sec_diff and eq_counts["differ"] == 0:
             status = "AGREE"
             agreed_count += 1
         else:
             status = "DISAGREE"
             disagreed_count += 1
-            msg = f"Page {p}: Cross-model disagreement!\n"
+            msg_parts = []
             if eq_diff:
-                msg += f"  Equation differences: primary={primary_eqs}, cross={cross_eqs}, diff={eq_diff}\n"
+                msg_parts.append(f"Equation label differences: primary={primary_eqs}, cross={cross_eqs}, diff={eq_diff}")
             if sec_diff:
-                msg += f"  Section differences: primary={primary_secs}, cross={cross_secs}, diff={sec_diff}"
-            failures.append(msg)
+                msg_parts.append(f"Section differences: primary={primary_secs}, cross={cross_secs}, diff={sec_diff}")
+            if differing_labels:
+                msg_parts.append(f"Equation body differ: {differing_labels}")
+            failures.append(f"Page {p}: Cross-model disagreement! ({'; '.join(msg_parts)})")
 
         spot_results.append({
             "page": p,
             "group": group,
             "status": status,
-            "vendor": cross_vendor,
-            "model": cross_model_id,
+            "vendor": cross_vendor or "unknown",
+            "model": effective_model,
+            "eq_counts": eq_counts,
             "primary_eqs": primary_eqs,
             "cross_eqs": cross_eqs,
             "primary_secs": primary_secs,
             "cross_secs": cross_secs,
             "eq_diff": eq_diff,
-            "sec_diff": sec_diff
+            "sec_diff": sec_diff,
+            "differing_labels": differing_labels
         })
 
     verified_count = agreed_count + disagreed_count
@@ -1156,15 +1253,20 @@ def check_cross_model_spot(
         "sampled_pages": all_sampled,
         "dense_group": dense_pages,
         "random_group": random_pages,
+        "cross_vendor": cross_vendor or "unknown",
+        "cross_model": effective_model,
         "target_coverage_pct": round(target_coverage_pct, 1),
         "achieved_coverage_pct": round(achieved_coverage_pct, 1),
         "agreed_count": agreed_count,
         "disagreed_count": disagreed_count,
         "unverified_count": unverified_count,
+        "total_match": sum(r.get("eq_counts", {}).get("match", 0) for r in spot_results),
+        "total_notation_only": sum(r.get("eq_counts", {}).get("notation_only", 0) for r in spot_results),
+        "total_differ": sum(r.get("eq_counts", {}).get("differ", 0) for r in spot_results),
         "results": spot_results
     }
 
-    return (len(failures) == 0 and unverified_count == 0), failures, stats
+    return (len(failures) == 0 and unverified_count == 0 and disagreed_count == 0), failures, stats
 
 
 def check_three_way_comparison(
@@ -1485,6 +1587,25 @@ def generate_verification_report(
                 fail_str = ", ".join(r["missing_in_trans"]) if r["missing_in_trans"] else "—"
                 warn_str = ", ".join(r["missing_in_pdf"]) if r["missing_in_pdf"] else "—"
                 lines.append(f"| {r['page']} | {r['chapter']} | {pdf_str} | {trans_str} | {fail_str} | {warn_str} | {r['status']} |")
+            lines.append("")
+        elif name == "g) Cross-Model Spot Check" and "results" in stats:
+            lines.append("")
+            lines.append(f"- **Cross Vendor:** {stats.get('cross_vendor', 'unknown')}")
+            lines.append(f"- **Cross Model:** {stats.get('cross_model', 'unknown')}")
+            lines.append(f"- **Sampled Pages:** {len(stats.get('sampled_pages', []))} ({stats.get('achieved_coverage_pct', 0.0)}% coverage of in-scope pages)")
+            lines.append(f"- **Agreed Pages:** {stats.get('agreed_count', 0)}")
+            lines.append(f"- **Disagreed Pages:** {stats.get('disagreed_count', 0)}")
+            lines.append(f"- **Unverified Pages:** {stats.get('unverified_count', 0)}")
+            lines.append(f"- **Equation Body Totals:** {stats.get('total_match', 0)} exact matches, {stats.get('total_notation_only', 0)} notation-only variations, {stats.get('total_differ', 0)} substantive differences")
+            lines.append("")
+            lines.append("#### Per-Page Equation Body Comparison Table")
+            lines.append("")
+            lines.append("| Page | Group | Status | Match | Notation Only | Differ | Differing Labels |")
+            lines.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+            for r in stats["results"]:
+                eq_c = r.get("eq_counts", {})
+                diff_labs = ", ".join(r.get("differing_labels", [])) if r.get("differing_labels") else "—"
+                lines.append(f"| page_{r['page']:04d} | {r.get('group', '—')} | {r['status']} | {eq_c.get('match', 0)} | {eq_c.get('notation_only', 0)} | {eq_c.get('differ', 0)} | {diff_labs} |")
             lines.append("")
         elif stats:
             lines.append(f"```json\n{json.dumps(stats, indent=2)}\n```")

@@ -769,3 +769,131 @@ def test_unset_api_key_raises_error(tmp_path: Path, monkeypatch):
             api_key=None,
             cross_dir=tmp_path / "cross"
         )
+
+
+def test_cross_model_identical_labels_differing_equation_bodies_gives_disagree(tmp_path: Path):
+    """
+    Check g: Identical equation labels with differing equation bodies gives DISAGREE.
+    Excused by adjudication with 'layout_only' or 'ambiguous_print'.
+    """
+    pages_dir = tmp_path / "pages"
+    pages_dir.mkdir()
+    cross_dir = tmp_path / "cross_model"
+    cross_dir.mkdir()
+
+    # Primary page has Eq (2.1) with body: Ax = b
+    (pages_dir / "page_0040.md").write_text(r"$$ Ax = b \quad (2.1) $$")
+    # Cross page has same label (2.1) but differing body: Ax = c
+    (cross_dir / "page_0040_cross.md").write_text(r"$$ Ax = c \quad (2.1) $$")
+
+    manifest = {
+        "cross_model": {"vendor": "Anthropic", "model": "claude-opus-5-5"},
+        "pages": {"page_0040": {}}
+    }
+    (cross_dir / "manifest.json").write_text(json.dumps(manifest))
+
+    meta = {2: {"chapter_start": {"value": 40}, "chapter_end": {"value": 40}}}
+    passed, failures, stats = check_cross_model_spot(
+        pages_dir=pages_dir,
+        sampled_pages=[40],
+        retranscribe=False,
+        cross_dir=cross_dir,
+        in_scope_pages=[40],
+        chapters_meta=meta,
+        primary_vendor="Google"
+    )
+
+    assert passed is False
+    assert stats["disagreed_count"] == 1
+    assert stats["agreed_count"] == 0
+    res = stats["results"][0]
+    assert res["status"] == "DISAGREE"
+    assert res["eq_counts"]["differ"] == 1
+    assert "2.1" in res["differing_labels"]
+
+    # When adjudication excuses it with layout_only, status becomes AGREE
+    adjudication = {
+        "verdicts": [
+            {"page": 40, "label": "2.1", "verdict": "layout_only"}
+        ]
+    }
+    (cross_dir / "adjudication.json").write_text(json.dumps(adjudication))
+    passed_adj, _, stats_adj = check_cross_model_spot(
+        pages_dir=pages_dir,
+        sampled_pages=[40],
+        retranscribe=False,
+        cross_dir=cross_dir,
+        in_scope_pages=[40],
+        chapters_meta=meta,
+        primary_vendor="Google"
+    )
+    assert passed_adj is True
+    assert stats_adj["agreed_count"] == 1
+    assert stats_adj["results"][0]["status"] == "AGREE"
+    assert stats_adj["results"][0]["eq_counts"]["notation_only"] == 1
+    assert stats_adj["results"][0]["eq_counts"]["differ"] == 0
+
+
+def test_running_head_section_not_counted_as_section():
+    """
+    extract_section_headings: Heading like '## Section 2.1 Vectors' is skipped as a running head.
+    """
+    running_head_text = r"""
+    ## Section 2.1 Vectors
+    This is running head commentary.
+    """
+    headings = extract_section_headings(running_head_text, 2)
+    assert headings == []
+
+    real_sec_text = r"""
+    ## 2.1 Vectors
+    Section body.
+    """
+    headings_real = extract_section_headings(real_sec_text, 2)
+    assert headings_real == ["2.1"]
+
+    both_text = r"""
+    ## Section 2.1 Vectors
+    Header line.
+
+    ## 2.1 Vectors
+    Section body.
+    """
+    headings_both = extract_section_headings(both_text, 2)
+    assert headings_both == ["2.1"]
+
+
+def test_cross_model_manifest_vendor_google_gives_fail(tmp_path: Path):
+    """
+    Check g: A cross manifest with vendor Google gives FAIL.
+    """
+    pages_dir = tmp_path / "pages"
+    pages_dir.mkdir()
+    cross_dir = tmp_path / "cross_model"
+    cross_dir.mkdir()
+
+    (pages_dir / "page_0046.md").write_text(r"$$ x = 1 \quad (2.1) $$")
+    (cross_dir / "page_0046_cross.md").write_text(r"$$ x = 1 \quad (2.1) $$")
+
+    manifest = {
+        "cross_model": {"vendor": "Google", "model": "gemini-2.5-flash"},
+        "pages": {"page_0046": {}}
+    }
+    (cross_dir / "manifest.json").write_text(json.dumps(manifest))
+
+    meta = {2: {"chapter_start": {"value": 46}, "chapter_end": {"value": 46}}}
+    passed, failures, stats = check_cross_model_spot(
+        pages_dir=pages_dir,
+        sampled_pages=[46],
+        retranscribe=False,
+        cross_dir=cross_dir,
+        in_scope_pages=[46],
+        chapters_meta=meta,
+        primary_vendor="Google"
+    )
+
+    assert passed is False
+    assert any("matches primary vendor" in f for f in failures)
+    assert stats["cross_vendor"] == "Google"
+    assert stats["achieved_coverage_pct"] == 0.0
+
