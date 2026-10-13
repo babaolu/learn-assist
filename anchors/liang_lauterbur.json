@@ -1,0 +1,94 @@
+{
+  "book": "Principles of magnetic resonance imaging",
+  "authors": "Liang, Zhi-Pei and Lauterbur, Paul C.",
+  "chapters": {
+    "2": {
+      "chapter_start": {
+        "value": 33,
+        "source": "text layer"
+      },
+      "chapter_end": {
+        "value": 76,
+        "source": "text layer"
+      },
+      "exercises_start": {
+        "value": 72,
+        "source": "text layer"
+      },
+      "last_equation": {
+        "value": 141,
+        "label": "2.141",
+        "page": 70,
+        "source": "text layer"
+      },
+      "problems": {
+        "start": 1,
+        "end": 32,
+        "count": 32,
+        "source": "text layer"
+      },
+      "figures": {
+        "start": 1,
+        "end": 18,
+        "count": 18,
+        "source": "text layer"
+      },
+      "sections": {
+        "start": 1,
+        "end": 6,
+        "count": 6,
+        "source": "text layer"
+      },
+      "tables": {
+        "items": [],
+        "count": 0,
+        "source": "text layer"
+      }
+    },
+    "3": {
+      "chapter_start": {
+        "value": 77,
+        "source": "text layer"
+      },
+      "chapter_end": {
+        "value": 125,
+        "source": "text layer"
+      },
+      "exercises_start": {
+        "value": 121,
+        "source": "text layer"
+      },
+      "last_equation": {
+        "value": 154,
+        "label": "3.154",
+        "page": 120,
+        "source": "page image PDF 120"
+      },
+      "problems": {
+        "start": 1,
+        "end": 41,
+        "count": 41,
+        "source": "text layer"
+      },
+      "figures": {
+        "start": 1,
+        "end": 14,
+        "count": 14,
+        "source": "text layer"
+      },
+      "sections": {
+        "start": 1,
+        "end": 4,
+        "count": 4,
+        "source": "text layer"
+      },
+      "tables": {
+        "items": [
+          1
+        ],
+        "count": 1,
+        "source": "text layer"
+      }
+    }
+  }
+}

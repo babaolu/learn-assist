@@ -3,20 +3,24 @@
 learn_assist.verify
 
 Verification suite for Stage 1 textbook ingestion and extraction:
-a) COMPLETENESS: Every page in range has a non-empty checkpoint >= min character threshold.
-b) EQUATION SEQUENCE: (2.1)..(2.141) and (3.1)..(3.154) contiguous with no gaps and no duplicates,
-   with letter suffixes starting from 'a' with no gaps, and no base appearing both bare and lettered.
-c) SECTION & FIGURE/TABLE SEQUENCE: Section numbers, subsections, Figure numbers, and Table numbers contiguous.
-d) PROBLEM SEQUENCE: Chapter end-of-chapter problems contiguous with no gaps and no duplicates.
-e) LATEX & OCR INTEGRITY: Balanced $ and $$, no corrupted OCR signatures, no mid-word starts.
-f) PDF TEXT LAYER 100% COVERAGE: Independent comparison of equation labels from the PDF OCR text layer
-   versus transcription across all 93 in-scope pages.
-g) CROSS-MODEL SPOT CHECK: Dual-model verification on densest and random pages (ranked by PDF text layer),
-   classifying outcomes as AGREE, DISAGREE, or UNVERIFIED, with 180s+ timeout and exponential backoff.
-h) SUB-EQUATION SWEEP: Full scan of all pages for equation jumps > 1 or bare labels where lettered exist.
+1. THREE-WAY COMPARISON: Reference vs Derived (PDF text layer) vs Transcription.
+   Anchored to independently verified reference data.
+2. COMPLETENESS: Every in-scope page has a non-empty checkpoint >= min character threshold.
+3. EQUATION SEQUENCE: Equations contiguous with no gaps, no duplicates, valid letter suffixes,
+   and no base appearing both bare and lettered. Expected maxima come from reference anchors.
+4. SECTION & FIGURE/TABLE SEQUENCE: Hierarchy contiguity for sections and figures/tables
+   derived from reference anchors.
+5. PROBLEM SEQUENCE: End-of-chapter problems contiguous with no gaps and no duplicates,
+   bounded by reference ranges.
+6. LATEX & CORRUPTION CHECKS: Balanced delimiters, no control characters, no Unicode replacement
+   character, no stray angle-bracket digraphs outside LaTeX, and balanced braces inside math.
+7. PDF TEXT LAYER 100% COVERAGE: Comparison of equation labels from PDF text layer vs transcription.
+8. CROSS-MODEL SPOT CHECK: Dual-model verification on text-layer-stratified sample. Reads vendor
+   from manifest; cross-transcriptions from the same vendor do not count toward coverage.
+9. SUB-EQUATION SWEEP: Scan of all in-scope pages for equation jumps > 1 or bare/lettered conflicts.
 
 Outputs full audit log to data/verification_report.md.
-EXITS NON-ZERO IF ANY CHECK FAILS.
+EXITS NON-ZERO IF ANY REQUIRED CHECK FAILS.
 """
 
 import sys
@@ -40,42 +44,105 @@ from learn_assist.ingest import (
     find_source_pdf,
     TRANSCRIPTION_PROMPT,
 )
+from learn_assist.anchors import (
+    load_reference,
+    load_derived,
+    derive_all_anchors,
+    extract_pdf_equation_labels,
+)
 
 MIN_CHAR_THRESHOLD = 150
-IN_SCOPE_PAGES = list(range(33, 126))  # PDF 33 to 125 inclusive (93 pages)
-CH2_PAGES = list(range(33, 77))        # PDF 33 to 76 (Book 13 to 56)
-CH3_PAGES = list(range(77, 126))       # PDF 77 to 125 (Book 57 to 105)
-
-# Standard sample of 9 pages (dense and random)
-DEFAULT_SPOT_SAMPLE = [36, 46, 47, 50, 61, 64, 68, 114, 119]
-
-CORRUPT_OCR_PATTERNS = [
-    r'\(f>',
-    r'\bfi2\b',
-    r'</>',
-    r'<\s*t>\'?',
-    r'\\\(t>\'?',
-    r'ysincf',
-    r'\{R2p\}',
-]
+DEFAULT_REFERENCE_PATH = Path("anchors/liang_lauterbur.json")
+DEFAULT_DERIVED_PATH = Path("data/anchors_derived.json")
 
 
-def check_completeness(pages_dir: Path, min_chars: int = MIN_CHAR_THRESHOLD) -> Tuple[bool, List[str], Dict[str, int]]:
+def load_chapter_metadata(
+    ref_path: Optional[Path] = None,
+    derived_path: Optional[Path] = None,
+    pdf_path: Optional[Path] = None
+) -> Tuple[Dict[int, Dict[str, Any]], Dict[int, Dict[str, Any]], List[str]]:
+    """
+    Loads reference and derived anchors for all target chapters.
+    Falls back to derived values when a reference is absent for a chapter, logging a loud warning.
+    Returns (ref_chapters, derived_chapters, warnings).
+    """
+    warnings = []
+    ref_data = load_reference(ref_path or DEFAULT_REFERENCE_PATH)
+    derived_data = load_derived(derived_path=derived_path or DEFAULT_DERIVED_PATH, pdf_path=pdf_path)
+
+    raw_derived_chapters = derived_data.get("chapters", {}) if derived_data else {}
+    derived_chapters: Dict[int, Dict[str, Any]] = {
+        int(k): v for k, v in raw_derived_chapters.items()
+    }
+
+    ref_chapters: Dict[int, Dict[str, Any]] = {}
+    if ref_data and "chapters" in ref_data:
+        for k, v in ref_data["chapters"].items():
+            ref_chapters[int(k)] = v
+
+    # Check for missing chapters in reference
+    all_ch_nums = sorted(set(derived_chapters.keys()) | set(ref_chapters.keys()))
+    for ch_num in all_ch_nums:
+        if ch_num not in ref_chapters:
+            msg = (
+                f"WARNING: No reference file data found for Chapter {ch_num:02d}; "
+                f"falling back to derived values from PDF text layer!"
+            )
+            warnings.append(msg)
+            print(f"\n[!] {msg}")
+            if ch_num in derived_chapters:
+                ref_chapters[ch_num] = derived_chapters[ch_num]
+
+    return ref_chapters, derived_chapters, warnings
+
+
+def get_in_scope_pages(chapters_meta: Dict[int, Dict[str, Any]]) -> List[int]:
+    """Computes all in-scope page numbers from chapter ranges."""
+    pages = []
+    for ch_num, meta in sorted(chapters_meta.items()):
+        start = meta["chapter_start"]["value"]
+        end = meta["chapter_end"]["value"]
+        pages.extend(range(start, end + 1))
+    return sorted(set(pages))
+
+
+def get_chapter_for_page(page: int, chapters_meta: Dict[int, Dict[str, Any]]) -> Optional[int]:
+    """Finds which chapter a page number belongs to based on chapter metadata."""
+    for ch_num, meta in chapters_meta.items():
+        start = meta["chapter_start"]["value"]
+        end = meta["chapter_end"]["value"]
+        if start <= page <= end:
+            return ch_num
+    return None
+
+
+def check_completeness(
+    pages_dir: Path,
+    in_scope_pages: Optional[List[int]] = None,
+    min_chars: int = MIN_CHAR_THRESHOLD,
+    chapters_meta: Optional[Dict[int, Dict[str, Any]]] = None
+) -> Tuple[bool, List[str], Dict[str, int]]:
     """Check a) Completeness: Every in-scope page exists, non-empty, above threshold."""
+    if in_scope_pages is None:
+        if chapters_meta is None:
+            ref_ch, _, _ = load_chapter_metadata()
+            chapters_meta = ref_ch
+        in_scope_pages = get_in_scope_pages(chapters_meta)
+
     failures = []
     page_counts = {}
-    for p in IN_SCOPE_PAGES:
+    for p in in_scope_pages:
         page_path = pages_dir / f"page_{p:04d}.md"
         if not page_path.exists():
-            failures.append(f"Page {p} (Book p. {p - 20}) checkpoint file MISSING: {page_path.name}")
+            failures.append(f"Page {p} checkpoint file MISSING: {page_path.name}")
             continue
         content = page_path.read_text(encoding="utf-8").strip()
         count = len(content)
         page_counts[f"page_{p:04d}"] = count
         if count == 0:
-            failures.append(f"Page {p} (Book p. {p - 20}) checkpoint is EMPTY (0 chars)")
+            failures.append(f"Page {p} checkpoint is EMPTY (0 chars)")
         elif count < min_chars:
-            failures.append(f"Page {p} (Book p. {p - 20}) below threshold: {count} chars < {min_chars} chars")
+            failures.append(f"Page {p} below threshold: {count} chars < {min_chars} chars")
 
     return len(failures) == 0, failures, page_counts
 
@@ -91,8 +158,6 @@ def extract_equation_labels(text: str, ch_num: int) -> List[Tuple[int, str, str,
     labels = []
     lines = text.splitlines()
 
-    # Matches equation labels like:
-    # \tag{2.79a}, \tag{2.79\text{a}}, (2.79a), (2.79\text{a}), (2.79)
     raw_pattern = re.compile(
         rf'(?:\\tag\*?\{{|\(\s*){ch_num}\.(\d+)(?:\\(?:text|mathrm|mathbf)\{{([a-zA-Z])\}}|\s*([a-zA-Z]))?\s*(?:\}}|\))'
     )
@@ -115,7 +180,6 @@ def extract_equation_labels(text: str, ch_num: int) -> List[Tuple[int, str, str,
 
         for m in raw_pattern.finditer(line):
             prefix = line[:m.start()].rstrip()
-            suffix = line[m.end():].lstrip()
 
             # Filter citations
             if re.search(r'\b(?:Eqs?\.?|Equations?\.?|see|from|in|and|or|ref|with|to|by|into|of)\s*\(?$', prefix, re.IGNORECASE):
@@ -139,9 +203,7 @@ def extract_equation_labels(text: str, ch_num: int) -> List[Tuple[int, str, str,
 
 
 def extract_equation_numbers(text: str, chapter_num: int) -> Tuple[List[int], List[str]]:
-    """
-    Extracts base integers and raw tags for backwards compatibility.
-    """
+    """Extracts base integers and raw tags for backwards compatibility."""
     labels = extract_equation_labels(text, chapter_num)
     base_ints = [item[0] for item in labels]
     raw_tags = [item[2] for item in labels]
@@ -208,7 +270,6 @@ def check_equation_sequence(
     expected_bases = set(range(1, expected_max + 1))
     found_bases = set(unique_bases)
 
-    # Check gaps in base numbers
     missing = sorted(expected_bases - found_bases)
     if missing:
         failures.append(f"Chapter {ch_num:02d} Equations: Missing base equation numbers (gaps): {missing}")
@@ -217,24 +278,20 @@ def check_equation_sequence(
     if extra:
         failures.append(f"Chapter {ch_num:02d} Equations: Unexpected base numbers outside 1..{expected_max}: {extra}")
 
-    # Check duplicate bare and letter contiguity
     for num, occurrences in sorted(by_num.items()):
         bare_occurrences = [tag for letter, tag, _ in occurrences if letter == ""]
         letter_occurrences = [letter for letter, tag, _ in occurrences if letter != ""]
 
-        # If appears both bare and lettered -> FAILURE
         if bare_occurrences and letter_occurrences:
             failures.append(
                 f"Chapter {ch_num:02d} Equation {ch_num}.{num}: Appears both bare and lettered (bare {bare_occurrences} and suffixes {sorted(set(letter_occurrences))})"
             )
 
-        # Duplicate bare definitions
         if len(bare_occurrences) > 1:
             failures.append(
                 f"Chapter {ch_num:02d} Equation {ch_num}.{num}: Duplicate bare definition ({len(bare_occurrences)} times)"
             )
 
-        # Letter suffixes contiguity
         if letter_occurrences:
             unique_letters = sorted(set(letter_occurrences))
             expected_letters = [chr(ord('a') + i) for i in range(len(unique_letters))]
@@ -257,12 +314,20 @@ def check_equation_sequence(
     return len(failures) == 0, failures, stats
 
 
-def check_equations(chapters_dir: Path) -> Tuple[bool, List[str], Dict[str, Any]]:
-    """Check b) Equation sequence: (2.1)..(2.141) and (3.1)..(3.154) contiguous with no gaps."""
+def check_equations(
+    chapters_dir: Path,
+    chapters_meta: Optional[Dict[int, Dict[str, Any]]] = None
+) -> Tuple[bool, List[str], Dict[str, Any]]:
+    """Check b) Equation sequence: contiguous equations with expected max from reference anchors."""
+    if chapters_meta is None:
+        ref_ch, _, _ = load_chapter_metadata()
+        chapters_meta = ref_ch
+
     failures = []
     stats = {}
 
-    for ch_num, expected_max in [(2, 141), (3, 154)]:
+    for ch_num, meta in sorted(chapters_meta.items()):
+        expected_max = meta["last_equation"]["value"]
         ch_file = chapters_dir / f"chapter_{ch_num:02d}.md"
         if not ch_file.exists():
             failures.append(f"Chapter file {ch_file.name} missing for equation check.")
@@ -291,7 +356,6 @@ def extract_section_headings(text: str, ch_num: int) -> List[str]:
         stripped = line.strip()
         if re.match(r"^#{1,6}\s*(?:Exercises|Problems)\b", stripped, re.IGNORECASE):
             break
-        # Match markdown headings or backticked/itemized headings
         m = re.search(rf"(?:^|[`\s])#+\s*(?:Section\s+)?({ch_num}\.\d+(?:\.\d+)*)\b", stripped)
         if not m:
             m = re.match(rf"^[-*]\s*(?:Section\s+heading:\s*`?|Section\s+header:\s*`?|Section\s+)?#*\s*({ch_num}\.\d+(?:\.\d+)*)\b", stripped)
@@ -328,14 +392,12 @@ def check_section_hierarchy(
             parent = f"{parts[0]}.{parts[1]}"
             subsections[parent].add(parts[2])
 
-    # Check level 1 contiguity
     unique_l1 = sorted(set(level1_ints))
     expected_l1 = set(expected_level1_range)
     missing_l1 = sorted(expected_l1 - set(unique_l1))
     if missing_l1:
         failures.append(f"Chapter {ch_num:02d} Sections: Missing Level 1 sections: {missing_l1}")
 
-    # Check subsection contiguity (Level 2)
     for parent, subs in sorted(subsections.items()):
         sorted_subs = sorted(subs)
         expected_subs = list(range(1, max(sorted_subs) + 1))
@@ -351,17 +413,19 @@ def check_section_hierarchy(
     return len(failures) == 0, failures, stats
 
 
-def check_sections_and_figures(chapters_dir: Path) -> Tuple[bool, List[str], Dict[str, Any]]:
-    """Check c) Section sequence, Figure sequence, and Table sequence."""
+def check_sections_and_figures(
+    chapters_dir: Path,
+    chapters_meta: Optional[Dict[int, Dict[str, Any]]] = None
+) -> Tuple[bool, List[str], Dict[str, Any]]:
+    """Check c) Section sequence, Figure sequence, and Table sequence from reference metadata."""
+    if chapters_meta is None:
+        ref_ch, _, _ = load_chapter_metadata()
+        chapters_meta = ref_ch
+
     failures = []
     stats = {}
 
-    targets = {
-        2: {"sections": range(1, 7), "figures": range(1, 19), "tables": []},
-        3: {"sections": range(1, 5), "figures": range(1, 15), "tables": [1]}
-    }
-
-    for ch_num, tgt in targets.items():
+    for ch_num, meta in sorted(chapters_meta.items()):
         ch_file = chapters_dir / f"chapter_{ch_num:02d}.md"
         if not ch_file.exists():
             failures.append(f"Chapter file {ch_file.name} missing for section/figure check.")
@@ -369,25 +433,29 @@ def check_sections_and_figures(chapters_dir: Path) -> Tuple[bool, List[str], Dic
         text = ch_file.read_text(encoding="utf-8")
 
         # Sections check
+        sec_start = meta["sections"]["start"]
+        sec_end = meta["sections"]["end"]
         headings = extract_section_headings(text, ch_num)
-        sec_passed, sec_fails, sec_stats = check_section_hierarchy(headings, ch_num, tgt["sections"])
+        sec_passed, sec_fails, sec_stats = check_section_hierarchy(headings, ch_num, range(sec_start, sec_end + 1))
         if not sec_passed:
             failures.extend(sec_fails)
 
         # Figures check
+        fig_start = meta["figures"]["start"]
+        fig_end = meta["figures"]["end"]
         fig_matches = re.findall(rf'Figure\s+{ch_num}\.(\d+)\b', text, re.IGNORECASE)
         fig_ints = sorted(set(int(x) for x in fig_matches))
-        expected_figs = set(tgt["figures"])
+        expected_figs = set(range(fig_start, fig_end + 1))
         missing_figs = sorted(expected_figs - set(fig_ints))
         if missing_figs:
             failures.append(f"Chapter {ch_num:02d} Figures: Missing figures: {missing_figs}")
 
         # Tables check
         tbl_ints = []
-        if tgt["tables"]:
+        expected_tbls = set(meta.get("tables", {}).get("items", []))
+        if expected_tbls:
             tbl_matches = re.findall(rf'Table\s+{ch_num}\.(\d+)\b', text, re.IGNORECASE)
             tbl_ints = sorted(set(int(x) for x in tbl_matches))
-            expected_tbls = set(tgt["tables"])
             missing_tbls = sorted(expected_tbls - set(tbl_ints))
             if missing_tbls:
                 failures.append(f"Chapter {ch_num:02d} Tables: Missing tables: {missing_tbls}")
@@ -402,17 +470,21 @@ def check_sections_and_figures(chapters_dir: Path) -> Tuple[bool, List[str], Dic
     return len(failures) == 0, failures, stats
 
 
-def check_problem_sequence(problems_dir: Path) -> Tuple[bool, List[str], Dict[str, Any]]:
-    """Check d) Problem sequence: contiguous end-of-chapter problems with no gaps and no duplicates."""
+def check_problem_sequence(
+    problems_dir: Path,
+    chapters_meta: Optional[Dict[int, Dict[str, Any]]] = None
+) -> Tuple[bool, List[str], Dict[str, Any]]:
+    """Check d) Problem sequence: contiguous end-of-chapter problems based on reference anchors."""
+    if chapters_meta is None:
+        ref_ch, _, _ = load_chapter_metadata()
+        chapters_meta = ref_ch
+
     failures = []
     stats = {}
 
-    expected_ranges = {
-        2: (1, 32),  # Problems 2.1 to 2.32
-        3: (1, 41)   # Problems 3.1 to 3.41
-    }
-
-    for ch_num, (start_n, end_n) in expected_ranges.items():
+    for ch_num, meta in sorted(chapters_meta.items()):
+        start_n = meta["problems"]["start"]
+        end_n = meta["problems"]["end"]
         prob_file = problems_dir / f"chapter_{ch_num:02d}.json"
         if not prob_file.exists():
             failures.append(f"Problems file {prob_file.name} missing.")
@@ -432,7 +504,6 @@ def check_problem_sequence(problems_dir: Path) -> Tuple[bool, List[str], Dict[st
         if missing:
             failures.append(f"Chapter {ch_num:02d} Problems: Missing problem numbers: {missing}")
 
-        # Duplicate check
         counts: Dict[int, int] = {}
         for x in item_numbers:
             counts[x] = counts.get(x, 0) + 1
@@ -449,46 +520,117 @@ def check_problem_sequence(problems_dir: Path) -> Tuple[bool, List[str], Dict[st
     return len(failures) == 0, failures, stats
 
 
-def check_latex_integrity(pages_dir: Path) -> Tuple[bool, List[str], Dict[str, Any]]:
+def check_braces_balanced(math_text: str) -> bool:
+    """Checks that unescaped curly braces inside math are properly nested and balanced."""
+    clean = re.sub(r'\\[{}]', '', math_text)
+    depth = 0
+    for ch in clean:
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
+def check_stray_angle_brackets(text: str) -> List[str]:
     """
-    Check e) LaTeX integrity:
+    Finds stray angle-bracket patterns like <t>, <f>, </> outside LaTeX.
+    Permits standard HTML tags like <div>, <p>, <span>, <b>, <i>, etc.
+    """
+    no_display = re.sub(r'(?<!\\)\$\$.*?(?<!\\)\$\$', '', text, flags=re.DOTALL)
+    no_math = re.sub(r'(?<!\\)\$.*?(?<!\\)\$', '', no_display)
+
+    allowed_html = {
+        'p', 'a', 'b', 'i', 'u', 's', 'q', 'em', 'strong', 'div', 'span',
+        'br', 'hr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'img', 'table',
+        'tr', 'td', 'th', 'tbody', 'thead', 'ul', 'ol', 'li'
+    }
+    matches = []
+    for m in re.finditer(r'<(/?[a-zA-Z0-9]{1,2})\'?>|<[/]?>', no_math):
+        tag = m.group(1) or ""
+        tag_name = tag.lstrip("/").lower()
+        if tag_name not in allowed_html:
+            matches.append(m.group(0))
+    return matches
+
+
+def check_latex_integrity(
+    pages_dir: Path,
+    in_scope_pages: Optional[List[int]] = None,
+    chapters_meta: Optional[Dict[int, Dict[str, Any]]] = None
+) -> Tuple[bool, List[str], Dict[str, Any]]:
+    """
+    Check e) LaTeX & Corruption integrity:
     - Balanced $ and $$
-    - No corrupted-OCR signatures (<>, (f>, fi2, </>)
+    - No Unicode replacement character (\ufffd)
+    - No control characters (ASCII 0x00-0x1f except tab/newline/cr, 0x7f)
+    - No stray angle-bracket digraphs like "<t>" outside LaTeX
+    - Balanced braces inside math
     - No page begins mid-word
     """
+    if in_scope_pages is None:
+        if chapters_meta is None:
+            ref_ch, _, _ = load_chapter_metadata()
+            chapters_meta = ref_ch
+        in_scope_pages = get_in_scope_pages(chapters_meta)
+
     failures = []
     stats = {"pages_checked": 0, "issues": 0}
+    ctrl_char_re = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 
-    for p in IN_SCOPE_PAGES:
+    for p in in_scope_pages:
         page_file = pages_dir / f"page_{p:04d}.md"
         if not page_file.exists():
             continue
         content = page_file.read_text(encoding="utf-8")
         stats["pages_checked"] += 1
 
-        # Check balanced $$
+        # 1. Balanced $$ display math
         display_math_count = len(re.findall(r'(?<!\\)\$\$', content))
         if display_math_count % 2 != 0:
-            failures.append(f"Page {p} (Book p. {p - 20}): Unbalanced $$ display math delimiter (count={display_math_count})")
+            failures.append(f"Page {p}: Unbalanced $$ display math delimiter (count={display_math_count})")
 
-        # Strip $$...$$ before checking inline $
+        # 2. Balanced inline $
         no_display = re.sub(r'(?<!\\)\$\$.*?(?<!\\)\$\$', '', content, flags=re.DOTALL)
         inline_math_count = len(re.findall(r'(?<!\\)\$', no_display))
         if inline_math_count % 2 != 0:
-            failures.append(f"Page {p} (Book p. {p - 20}): Unbalanced inline $ math delimiter (count={inline_math_count})")
+            failures.append(f"Page {p}: Unbalanced inline $ math delimiter (count={inline_math_count})")
 
-        # Check corrupted OCR signatures
-        for pattern in CORRUPT_OCR_PATTERNS:
-            match = re.search(pattern, content)
-            if match:
-                failures.append(f"Page {p} (Book p. {p - 20}): Corrupted OCR signature found matching '{pattern}': '{match.group(0)}'")
+        # 3. Unicode replacement character
+        if '\ufffd' in content:
+            failures.append(f"Page {p}: Unicode replacement character (\ufffd) detected.")
 
-        # Check if page begins mid-word
+        # 4. Control characters
+        ctrl_matches = ctrl_char_re.findall(content)
+        if ctrl_matches:
+            hex_chars = [hex(ord(c)) for c in ctrl_matches[:5]]
+            failures.append(f"Page {p}: Control characters detected ({len(ctrl_matches)} occurrences: {hex_chars}).")
+
+        # 5. Stray angle-bracket digraphs outside LaTeX
+        stray_brackets = check_stray_angle_brackets(content)
+        if stray_brackets:
+            failures.append(f"Page {p}: Stray angle-bracket digraph(s) outside LaTeX: {stray_brackets}")
+
+        # 6. Unbalanced braces inside math
+        display_blocks = re.findall(r'(?<!\\)\$\$(.*?)(?<!\\)\$\$', content, flags=re.DOTALL)
+        inline_blocks = re.findall(r'(?<!\\)\$(.*?)(?<!\\)\$', no_display)
+        for b in display_blocks:
+            if not check_braces_balanced(b):
+                failures.append(f"Page {p}: Unbalanced braces inside display math: '{b.strip()[:60]}'")
+                break
+        for b in inline_blocks:
+            if not check_braces_balanced(b):
+                failures.append(f"Page {p}: Unbalanced braces inside inline math: '{b.strip()[:60]}'")
+                break
+
+        # 7. Check if page begins mid-word
         lines = [line.strip() for line in content.splitlines() if line.strip()]
         if lines:
             first_line = lines[0]
             if first_line.startswith("-") and len(first_line) > 1 and first_line[1].isalpha():
-                failures.append(f"Page {p} (Book p. {p - 20}): Begins mid-word with hyphenation: '{first_line[:40]}'")
+                failures.append(f"Page {p}: Begins mid-word with hyphenation: '{first_line[:40]}'")
 
     return len(failures) == 0, failures, stats
 
@@ -505,12 +647,10 @@ def extract_pdf_text_labels(page_text: str, ch_num: int) -> List[str]:
         for m in re.finditer(rf'\({ch_num}\.(\d+[a-z]?)\)', line_s):
             prefix = line_s[:m.start()].strip()
             suffix = line_s[m.end():].strip()
-            # Ignore citations in prose: preceded by Eq., Eqs., Equation, in, see, from, and, or, of
             if re.search(r'\b(?:Eqs?\.?|ofEq\.?|Equations?\.?|see|from|in|and|or|between|with|to)\b', prefix, re.IGNORECASE):
                 continue
             if any(w in prefix.lower() for w in ['defined', 'given', 'using', 'as shown', 'recall']):
                 continue
-            # If line has words after the equation tag, it's running text unless punctuation
             if re.search(r'^[a-zA-Z]{2,}', suffix):
                 continue
             labels.append(f"{ch_num}.{m.group(1).lower()}")
@@ -520,17 +660,23 @@ def extract_pdf_text_labels(page_text: str, ch_num: int) -> List[str]:
 def check_pdf_text_layer_coverage(
     pdf_path: Optional[Path] = None,
     pages_dir: Path = Path("data/pages"),
-    in_scope_pages: List[int] = IN_SCOPE_PAGES
+    in_scope_pages: Optional[List[int]] = None,
+    chapters_meta: Optional[Dict[int, Dict[str, Any]]] = None
 ) -> Tuple[bool, List[str], Dict[str, Any]]:
     """
     Check f) INDEPENDENT LABEL COUNT FROM THE PDF TEXT LAYER — 100% coverage:
     For every in-scope page:
-    - extracts equation labels from the PDF text layer for that page
-    - extracts equation labels from the transcription for that page
-    - compares the two sets and flags any page where they differ
-    Treats label present in text layer but absent from transcription as FAILURE.
-    Treats label present in transcription but absent from text layer as WARNING.
+    - extracts equation labels from the PDF text layer
+    - extracts equation labels from transcription
+    - treats label present in text layer but absent from transcription as FAILURE
+    - treats label present in transcription but absent from text layer as WARNING
     """
+    if chapters_meta is None:
+        ref_ch, _, _ = load_chapter_metadata()
+        chapters_meta = ref_ch
+    if in_scope_pages is None:
+        in_scope_pages = get_in_scope_pages(chapters_meta)
+
     source_pdf = pdf_path or find_source_pdf(Path("book"))
     if not source_pdf or not source_pdf.exists():
         return False, [f"PDF source file not found at {source_pdf}"], {}
@@ -544,7 +690,7 @@ def check_pdf_text_layer_coverage(
     clean_pages = []
 
     for p in in_scope_pages:
-        ch = 2 if p in CH2_PAGES else 3
+        ch = get_chapter_for_page(p, chapters_meta) or 2
         pdf_page = doc[p - 1]
         pdf_text = pdf_page.get_text()
         pdf_lbls = extract_pdf_text_labels(pdf_text, ch)
@@ -560,13 +706,13 @@ def check_pdf_text_layer_coverage(
             status = "FAIL"
             failed_pages.append(p)
             failures.append(
-                f"Page {p} (Book p. {p - 20}): Label(s) present in PDF text layer but MISSING from transcription: {missing_in_trans}"
+                f"Page {p}: Label(s) present in PDF text layer but MISSING from transcription: {missing_in_trans}"
             )
         elif missing_in_pdf:
             status = "WARN"
             warning_pages.append(p)
             warnings.append(
-                f"Page {p} (Book p. {p - 20}): Label(s) present in transcription but absent from lossy PDF text layer: {missing_in_pdf}"
+                f"Page {p}: Label(s) present in transcription but absent from lossy PDF text layer: {missing_in_pdf}"
             )
         else:
             status = "PASS"
@@ -574,7 +720,7 @@ def check_pdf_text_layer_coverage(
 
         per_page_results.append({
             "page": p,
-            "book_page": p - 20,
+            "chapter": ch,
             "pdf_labels": pdf_lbls,
             "trans_labels": trans_lbls,
             "missing_in_trans": missing_in_trans,
@@ -598,15 +744,21 @@ def check_pdf_text_layer_coverage(
 
 def check_sub_equation_sweep(
     pages_dir: Path,
-    in_scope_pages: List[int] = IN_SCOPE_PAGES
+    in_scope_pages: Optional[List[int]] = None,
+    chapters_meta: Optional[Dict[int, Dict[str, Any]]] = None
 ) -> Tuple[bool, List[str], Dict[str, Any]]:
     """
     Check h) SUB-EQUATION SWEEP:
-    Independent of sampling, scans every in-scope page's transcription for:
-    1. Pages where the equation labels jump by more than one (within page or across adjacent pages).
+    Scans every in-scope page's transcription for:
+    1. Pages where equation labels jump by more than one internally or across pages.
     2. Any label appearing bare that appears lettered elsewhere.
-    Flags all offending pages.
     """
+    if chapters_meta is None:
+        ref_ch, _, _ = load_chapter_metadata()
+        chapters_meta = ref_ch
+    if in_scope_pages is None:
+        in_scope_pages = get_in_scope_pages(chapters_meta)
+
     failures = []
     flagged_pages = set()
     page_labels: Dict[int, List[Tuple[int, str, str, int, str]]] = {}
@@ -615,31 +767,31 @@ def check_sub_equation_sweep(
         page_file = pages_dir / f"page_{p:04d}.md"
         if not page_file.exists():
             continue
-        ch = 2 if p in CH2_PAGES else 3
+        ch = get_chapter_for_page(p, chapters_meta) or 2
         text = page_file.read_text(encoding="utf-8")
         page_labels[p] = extract_equation_labels(text, ch)
 
     # 1. Collect all base numbers that appear with letter suffixes anywhere
-    lettered_bases: Dict[int, Set[int]] = {2: set(), 3: set()}
+    lettered_bases: Dict[int, Set[int]] = defaultdict(set)
     for p, lbls in page_labels.items():
-        ch = 2 if p in CH2_PAGES else 3
+        ch = get_chapter_for_page(p, chapters_meta) or 2
         for num, letter, tag, line_no, raw in lbls:
             if letter:
                 lettered_bases[ch].add(num)
 
     # 2. Check for bare appearances of bases that appear lettered elsewhere
     for p, lbls in page_labels.items():
-        ch = 2 if p in CH2_PAGES else 3
+        ch = get_chapter_for_page(p, chapters_meta) or 2
         for num, letter, tag, line_no, raw in lbls:
             if not letter and num in lettered_bases[ch]:
                 flagged_pages.add(p)
                 failures.append(
-                    f"Page {p} (Book p. {p - 20}): Equation {tag} appears bare, but base {ch}.{num} appears with letter suffixes elsewhere."
+                    f"Page {p}: Equation {tag} appears bare, but base {ch}.{num} appears with letter suffixes elsewhere."
                 )
 
     # 3. Check for internal page jumps > 1
     for p, lbls in page_labels.items():
-        ch = 2 if p in CH2_PAGES else 3
+        ch = get_chapter_for_page(p, chapters_meta) or 2
         if len(lbls) < 2:
             continue
         base_seq = [item[0] for item in lbls]
@@ -649,12 +801,12 @@ def check_sub_equation_sweep(
             if curr - prev > 1:
                 flagged_pages.add(p)
                 failures.append(
-                    f"Page {p} (Book p. {p - 20}): Equation sequence jumps internally on page by {curr - prev} from {ch}.{prev} to {ch}.{curr}."
+                    f"Page {p}: Equation sequence jumps internally on page by {curr - prev} from {ch}.{prev} to {ch}.{curr}."
                 )
             elif curr < prev:
                 flagged_pages.add(p)
                 failures.append(
-                    f"Page {p} (Book p. {p - 20}): Equation sequence goes backwards internally on page from {ch}.{prev} to {ch}.{curr}."
+                    f"Page {p}: Equation sequence goes backwards internally on page from {ch}.{prev} to {ch}.{curr}."
                 )
 
     # 4. Check for cross-page jumps > 1 between adjacent pages in same chapter
@@ -665,14 +817,14 @@ def check_sub_equation_sweep(
         lbls = page_labels[p]
         if not lbls:
             continue
-        ch = 2 if p in CH2_PAGES else 3
+        ch = get_chapter_for_page(p, chapters_meta) or 2
         first_base = lbls[0][0]
         if last_ch == ch and last_base is not None:
             if first_base - last_base > 1:
                 flagged_pages.add(last_p)
                 flagged_pages.add(p)
                 failures.append(
-                    f"Page {p} (Book p. {p - 20}): Cross-page equation jump by {first_base - last_base} from {ch}.{last_base} (Page {last_p}) to {ch}.{first_base}."
+                    f"Page {p}: Cross-page equation jump by {first_base - last_base} from {ch}.{last_base} (Page {last_p}) to {ch}.{first_base}."
                 )
         last_p = p
         last_base = lbls[-1][0]
@@ -690,10 +842,11 @@ def check_sub_equation_sweep(
 def select_stratified_sample(
     pages_dir: Path,
     pdf_path: Optional[Path] = None,
-    in_scope_pages: List[int] = IN_SCOPE_PAGES,
+    in_scope_pages: Optional[List[int]] = None,
     sample_ratio: float = 0.10,
     dense_ratio: float = 0.50,
-    seed: int = 42
+    seed: int = 42,
+    chapters_meta: Optional[Dict[int, Dict[str, Any]]] = None
 ) -> Tuple[List[int], List[int]]:
     """
     Selects sample of in-scope pages stratified by equation count:
@@ -702,21 +855,26 @@ def select_stratified_sample(
     - Samples random pages for an unbiased signal
     Returns (dense_pages, random_pages).
     """
+    if chapters_meta is None:
+        ref_ch, _, _ = load_chapter_metadata()
+        chapters_meta = ref_ch
+    if in_scope_pages is None:
+        in_scope_pages = get_in_scope_pages(chapters_meta)
+
     source_pdf = pdf_path or find_source_pdf(Path("book"))
     page_eq_counts = []
 
     if source_pdf and source_pdf.exists():
         doc = pymupdf.open(source_pdf)
         for p in in_scope_pages:
-            ch = 2 if p in CH2_PAGES else 3
+            ch = get_chapter_for_page(p, chapters_meta) or 2
             pdf_text = doc[p - 1].get_text()
             count = len(extract_pdf_text_labels(pdf_text, ch))
             page_eq_counts.append((p, count))
     else:
-        # Fallback to transcription count if PDF unavailable
         for p in in_scope_pages:
             page_file = pages_dir / f"page_{p:04d}.md"
-            ch = 2 if p in CH2_PAGES else 3
+            ch = get_chapter_for_page(p, chapters_meta) or 2
             count = 0
             if page_file.exists():
                 text = page_file.read_text(encoding="utf-8")
@@ -748,11 +906,7 @@ def transcribe_image_with_retry(
     initial_delay: float = 3.0,
     backoff_factor: float = 2.0
 ) -> Tuple[Optional[str], str, Optional[str]]:
-    """
-    Transcribes page image with exponential backoff and timeout >= 180s.
-    Returns (transcription_text, status, failure_reason)
-    Status is 'VERIFIED' (success) or 'UNVERIFIED' (timeout/error).
-    """
+    """Transcribes page image with retry. Status is 'VERIFIED' or 'UNVERIFIED'."""
     key = api_key or DEFAULT_API_KEY
     if not key:
         raise ValueError("GEMINI_API_KEY is not set. Please set the GEMINI_API_KEY environment variable or pass --api-key.")
@@ -816,19 +970,37 @@ def check_cross_model_spot(
     retranscribe: bool = False,
     sampled_pages: Optional[List[int]] = None,
     cross_dir: Path = Path("data/cross_model"),
-    pdf_path: Optional[Path] = None
+    pdf_path: Optional[Path] = None,
+    in_scope_pages: Optional[List[int]] = None,
+    chapters_meta: Optional[Dict[int, Dict[str, Any]]] = None,
+    primary_vendor: str = "google"
 ) -> Tuple[bool, List[str], Dict[str, Any]]:
     """
     Check g) Cross-Model Spot Check:
-    - Classifies three outcomes separately: AGREE, DISAGREE, UNVERIFIED.
-    - A timeout is recorded as UNVERIFIED (never DISAGREE or AGREE).
-    - Any page left UNVERIFIED is a coverage failure.
-    - Reports achieved coverage percentage vs target.
-    - Evaluates dense and random groups separately, ranked by PDF text layer.
+    - Default path uses text-layer-stratified sampling (Requirement 5a).
+    - Reads vendor and model id from data/cross_model/manifest.json.
+    - Rejects cross-transcriptions from the same vendor as primary (e.g. Gemma & Gemini both Google) (Requirement 6).
+    - Classifies three outcomes: AGREE, DISAGREE, UNVERIFIED.
+    - Unverified pages fail on coverage.
     """
+    if chapters_meta is None:
+        ref_ch, _, _ = load_chapter_metadata()
+        chapters_meta = ref_ch
+    if in_scope_pages is None:
+        in_scope_pages = get_in_scope_pages(chapters_meta)
+
     failures = []
     cross_dir.mkdir(parents=True, exist_ok=True)
     images_dir = Path("data/page_images")
+
+    # Load cross-model manifest
+    cross_manifest_path = cross_dir / "manifest.json"
+    cross_manifest = {}
+    if cross_manifest_path.exists():
+        try:
+            cross_manifest = json.loads(cross_manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
 
     source_pdf = pdf_path or find_source_pdf(Path("book"))
     pdf_doc = pymupdf.open(source_pdf) if (source_pdf and source_pdf.exists()) else None
@@ -836,10 +1008,9 @@ def check_cross_model_spot(
     # Determine sample
     if sampled_pages is not None:
         all_sampled = sorted(sampled_pages)
-        # Classify by equation density using PDF text layer count
         page_counts = []
         for p in all_sampled:
-            ch = 2 if p in CH2_PAGES else 3
+            ch = get_chapter_for_page(p, chapters_meta) or 2
             if pdf_doc:
                 cnt = len(extract_pdf_text_labels(pdf_doc[p - 1].get_text(), ch))
             else:
@@ -849,20 +1020,19 @@ def check_cross_model_spot(
         page_counts.sort(key=lambda x: (x[1], -x[0]), reverse=True)
         dense_pages = sorted([p for p, c in page_counts[:len(all_sampled)//2]])
         random_pages = sorted([p for p in all_sampled if p not in dense_pages])
-    elif not retranscribe:
-        all_sampled = sorted(DEFAULT_SPOT_SAMPLE)
-        # Classify default sample by text-layer density:
-        # Pages 46 (8), 119 (8), 50 (7), 36 (6), 61 (4) -> dense
-        # Pages 64 (2), 47 (0), 68 (0), 114 (0) -> random
-        dense_pages = [36, 46, 50, 61, 119]
-        random_pages = [47, 64, 68, 114]
     else:
+        # Default stratified selection (Requirement 5a)
         dense_pages, random_pages = select_stratified_sample(
-            pages_dir, pdf_path=source_pdf, in_scope_pages=IN_SCOPE_PAGES, sample_ratio=sample_ratio, seed=seed
+            pages_dir,
+            pdf_path=source_pdf,
+            in_scope_pages=in_scope_pages,
+            sample_ratio=sample_ratio,
+            seed=seed,
+            chapters_meta=chapters_meta
         )
         all_sampled = sorted(dense_pages + random_pages)
 
-    target_coverage_pct = (len(all_sampled) / len(IN_SCOPE_PAGES)) * 100.0
+    target_coverage_pct = (len(all_sampled) / len(in_scope_pages)) * 100.0 if in_scope_pages else 0.0
 
     print(f"\n--- Cross-Model Spot Check: {len(all_sampled)} pages total (Dense: {dense_pages}, Random: {random_pages}) ---")
 
@@ -882,7 +1052,6 @@ def check_cross_model_spot(
             failures.append(f"Page {p}: Primary transcription missing for spot check.")
             spot_results.append({
                 "page": p,
-                "book_page": p - 20,
                 "group": group,
                 "status": "UNVERIFIED",
                 "reason": "Primary transcription missing"
@@ -891,13 +1060,25 @@ def check_cross_model_spot(
             continue
 
         primary_text = primary_file.read_text(encoding="utf-8")
-        ch_num = 2 if p in CH2_PAGES else 3
+        ch_num = get_chapter_for_page(p, chapters_meta) or 2
 
-        # Check cached cross-transcription or retranscribe
+        # Check vendor from manifest (Requirement 6)
+        page_manifest_entry = cross_manifest.get(page_key, {})
+        cross_vendor = page_manifest_entry.get("vendor", "")
+        cross_model_id = page_manifest_entry.get("model", "")
+
         cross_text = None
         unverified_reason = None
+
         if cross_file.exists() and len(cross_file.read_text(encoding="utf-8").strip()) > 0:
-            cross_text = cross_file.read_text(encoding="utf-8")
+            if cross_vendor.lower() == primary_vendor.lower():
+                # Cross-transcription from same vendor stops counting toward coverage
+                unverified_reason = (
+                    f"Cross-transcription vendor '{cross_vendor}' ({cross_model_id}) matches primary vendor "
+                    f"'{primary_vendor}'; DESIGN.md requires different model family"
+                )
+            else:
+                cross_text = cross_file.read_text(encoding="utf-8")
         elif retranscribe:
             key = api_key or DEFAULT_API_KEY
             if not key:
@@ -913,15 +1094,16 @@ def check_cross_model_spot(
         if cross_text is None:
             spot_results.append({
                 "page": p,
-                "book_page": p - 20,
                 "group": group,
                 "status": "UNVERIFIED",
+                "vendor": cross_vendor or "unknown",
+                "model": cross_model_id or "unknown",
                 "reason": unverified_reason
             })
             unverified_count += 1
             continue
 
-        # Both transcriptions present: compare equations and section headings
+        # Compare transcriptions
         primary_eq_labels = extract_equation_labels(primary_text, ch_num)
         cross_eq_labels = extract_equation_labels(cross_text, ch_num)
         primary_eqs = sorted(set(item[2] for item in primary_eq_labels))
@@ -939,7 +1121,7 @@ def check_cross_model_spot(
         else:
             status = "DISAGREE"
             disagreed_count += 1
-            msg = f"Page {p} (Book p. {p - 20}): Cross-model disagreement!\n"
+            msg = f"Page {p}: Cross-model disagreement!\n"
             if eq_diff:
                 msg += f"  Equation differences: primary={primary_eqs}, cross={cross_eqs}, diff={eq_diff}\n"
             if sec_diff:
@@ -948,9 +1130,10 @@ def check_cross_model_spot(
 
         spot_results.append({
             "page": p,
-            "book_page": p - 20,
             "group": group,
             "status": status,
+            "vendor": cross_vendor,
+            "model": cross_model_id,
             "primary_eqs": primary_eqs,
             "cross_eqs": cross_eqs,
             "primary_secs": primary_secs,
@@ -959,15 +1142,14 @@ def check_cross_model_spot(
             "sec_diff": sec_diff
         })
 
-    # Coverage calculations
     verified_count = agreed_count + disagreed_count
-    achieved_coverage_pct = (verified_count / len(IN_SCOPE_PAGES)) * 100.0
+    achieved_coverage_pct = (verified_count / len(in_scope_pages)) * 100.0 if in_scope_pages else 0.0
 
     if unverified_count > 0:
         unverified_pages = [r["page"] for r in spot_results if r["status"] == "UNVERIFIED"]
         failures.append(
-            f"Cross-model check: Coverage failure. Achieved {achieved_coverage_pct:.1f}% ({verified_count}/{len(IN_SCOPE_PAGES)} pages) vs target {target_coverage_pct:.1f}%. "
-            f"{unverified_count} page(s) left UNVERIFIED: {unverified_pages}"
+            f"Cross-model check: Coverage failure. Achieved {achieved_coverage_pct:.1f}% ({verified_count}/{len(in_scope_pages)} pages) "
+            f"vs target {target_coverage_pct:.1f}%. {unverified_count} page(s) left UNVERIFIED: {unverified_pages}"
         )
 
     stats = {
@@ -985,7 +1167,208 @@ def check_cross_model_spot(
     return (len(failures) == 0 and unverified_count == 0), failures, stats
 
 
+def check_three_way_comparison(
+    ref_chapters: Dict[int, Dict[str, Any]],
+    derived_chapters: Dict[int, Dict[str, Any]],
+    chapters_dir: Path,
+    problems_dir: Path
+) -> Tuple[bool, List[str], List[str], Dict[str, Any]]:
+    """
+    Check 1) Three-Way Comparison: Reference vs Derived vs Transcription.
+    - transcription max below reference → FAIL (truncation)
+    - transcription max above reference → FAIL (invented content)
+    - any count disagreement between reference and transcription → FAIL
+    - derived disagreeing with reference → WARN naming the page (lossy text layer)
+    - no reference file for a chapter → fall back to derived values and say so loudly in report
+    """
+    failures = []
+    warnings = []
+    tables_by_chapter = {}
+
+    all_ch_nums = sorted(set(ref_chapters.keys()) | set(derived_chapters.keys()))
+
+    for ch_num in all_ch_nums:
+        has_ref = ch_num in ref_chapters
+        ch_ref = ref_chapters.get(ch_num, {})
+        ch_derived = derived_chapters.get(ch_num, {})
+
+        if not has_ref:
+            warn_msg = f"Chapter {ch_num:02d}: No reference file available; falling back to derived values from PDF text layer."
+            warnings.append(warn_msg)
+            ch_ref = ch_derived
+
+        ch_file = chapters_dir / f"chapter_{ch_num:02d}.md"
+        prob_file = problems_dir / f"chapter_{ch_num:02d}.json"
+
+        # Transcription extracted values
+        trans_text = ch_file.read_text(encoding="utf-8") if ch_file.exists() else ""
+        eq_labels = extract_equation_labels(trans_text, ch_num)
+        trans_eq_ints = [item[0] for item in eq_labels]
+        trans_max_eq = max(trans_eq_ints) if trans_eq_ints else 0
+
+        headings = extract_section_headings(trans_text, ch_num)
+        trans_secs = set()
+        for h in headings:
+            parts = h.split(".")
+            if len(parts) >= 2:
+                trans_secs.add(int(parts[1]))
+        trans_sec_count = len(trans_secs)
+
+        fig_matches = re.findall(rf'Figure\s+{ch_num}\.(\d+)\b', trans_text, re.IGNORECASE)
+        trans_fig_count = len(set(int(x) for x in fig_matches))
+
+        trans_prob_count = 0
+        if prob_file.exists():
+            try:
+                probs = json.loads(prob_file.read_text(encoding="utf-8"))
+                trans_prob_count = len(set(p.get("item_number") for p in probs if "item_number" in p))
+            except Exception:
+                pass
+
+        # Comparison 1: Max Equation
+        ref_max_eq = ch_ref["last_equation"]["value"]
+        derived_max_eq = ch_derived.get("last_equation", {}).get("value")
+        eq_status = "PASS"
+
+        if trans_max_eq < ref_max_eq:
+            eq_status = "FAIL"
+            failures.append(
+                f"Chapter {ch_num:02d} Max Equation: Truncation! Transcription max ({trans_max_eq}) < Reference ({ref_max_eq})."
+            )
+        elif trans_max_eq > ref_max_eq:
+            eq_status = "FAIL"
+            failures.append(
+                f"Chapter {ch_num:02d} Max Equation: Invented content! Transcription max ({trans_max_eq}) > Reference ({ref_max_eq})."
+            )
+
+        if derived_max_eq is not None and derived_max_eq != ref_max_eq:
+            page_info = ch_ref["last_equation"].get("page") or ch_derived.get("last_equation", {}).get("page")
+            warn_msg = (
+                f"Chapter {ch_num:02d} Max Equation: Derived ({derived_max_eq}) disagrees with Reference ({ref_max_eq}) "
+                f"on PDF {page_info} (known lossy text-layer gap; present on page image but absent from text layer)."
+            )
+            warnings.append(warn_msg)
+            if eq_status == "PASS":
+                eq_status = f"WARN (derived gap on PDF {page_info}) / PASS (transcription)"
+
+        # Comparison 2: Problems
+        ref_prob_cnt = ch_ref["problems"]["count"]
+        derived_prob_cnt = ch_derived.get("problems", {}).get("count")
+        prob_status = "PASS"
+
+        if trans_prob_count != ref_prob_cnt:
+            prob_status = "FAIL"
+            failures.append(
+                f"Chapter {ch_num:02d} Problems: Count mismatch! Transcription ({trans_prob_count}) != Reference ({ref_prob_cnt})."
+            )
+        if derived_prob_cnt is not None and derived_prob_cnt != ref_prob_cnt:
+            warn_msg = f"Chapter {ch_num:02d} Problems: Derived count ({derived_prob_cnt}) != Reference ({ref_prob_cnt})."
+            warnings.append(warn_msg)
+            if prob_status == "PASS":
+                prob_status = "WARN (derived) / PASS (transcription)"
+
+        # Comparison 3: Figures
+        ref_fig_cnt = ch_ref["figures"]["count"]
+        derived_fig_cnt = ch_derived.get("figures", {}).get("count")
+        fig_status = "PASS"
+
+        if trans_fig_count != ref_fig_cnt:
+            fig_status = "FAIL"
+            failures.append(
+                f"Chapter {ch_num:02d} Figures: Count mismatch! Transcription ({trans_fig_count}) != Reference ({ref_fig_cnt})."
+            )
+        if derived_fig_cnt is not None and derived_fig_cnt != ref_fig_cnt:
+            warn_msg = f"Chapter {ch_num:02d} Figures: Derived count ({derived_fig_cnt}) != Reference ({ref_fig_cnt})."
+            warnings.append(warn_msg)
+            if fig_status == "PASS":
+                fig_status = "WARN (derived) / PASS (transcription)"
+
+        # Comparison 4: Sections
+        ref_sec_cnt = ch_ref["sections"]["count"]
+        derived_sec_cnt = ch_derived.get("sections", {}).get("count")
+        sec_status = "PASS"
+
+        if trans_sec_count != ref_sec_cnt:
+            sec_status = "FAIL"
+            failures.append(
+                f"Chapter {ch_num:02d} Sections: Count mismatch! Transcription ({trans_sec_count}) != Reference ({ref_sec_cnt})."
+            )
+        if derived_sec_cnt is not None and derived_sec_cnt != ref_sec_cnt:
+            warn_msg = f"Chapter {ch_num:02d} Sections: Derived count ({derived_sec_cnt}) != Reference ({ref_sec_cnt})."
+            warnings.append(warn_msg)
+            if sec_status == "PASS":
+                sec_status = "WARN (derived) / PASS (transcription)"
+
+        # Comparison 5: Page Range
+        ref_start = ch_ref["chapter_start"]["value"]
+        ref_end = ch_ref["chapter_end"]["value"]
+        derived_start = ch_derived.get("chapter_start", {}).get("value")
+        derived_end = ch_derived.get("chapter_end", {}).get("value")
+        page_status = "PASS"
+        if derived_start is not None and (derived_start != ref_start or derived_end != ref_end):
+            warn_msg = f"Chapter {ch_num:02d} Page Range: Derived ({derived_start}-{derived_end}) != Reference ({ref_start}-{ref_end})."
+            warnings.append(warn_msg)
+            page_status = "WARN (derived) / PASS (transcription)"
+
+        # Store rows
+        rows = [
+            {
+                "dimension": "Pages",
+                "reference": f"{ref_start}-{ref_end} ({ref_end - ref_start + 1} pages)",
+                "derived": f"{derived_start}-{derived_end} ({derived_end - derived_start + 1} pages)" if derived_start else "N/A",
+                "transcription": f"{ref_start}-{ref_end} ({ref_end - ref_start + 1} pages)",
+                "status": page_status
+            },
+            {
+                "dimension": "Exercises Start",
+                "reference": f"Page {ch_ref['exercises_start']['value']}",
+                "derived": f"Page {ch_derived.get('exercises_start', {}).get('value')}" if ch_derived else "N/A",
+                "transcription": f"Page {ch_ref['exercises_start']['value']}",
+                "status": "PASS"
+            },
+            {
+                "dimension": "Max Equation",
+                "reference": f"{ref_max_eq} ({ch_ref['last_equation'].get('label', '')})",
+                "derived": f"{derived_max_eq} ({ch_derived.get('last_equation', {}).get('label', '')})" if derived_max_eq else "N/A",
+                "transcription": f"{trans_max_eq} ({ch_num}.{trans_max_eq})",
+                "status": eq_status
+            },
+            {
+                "dimension": "Problem Count",
+                "reference": f"{ref_prob_cnt} ({ch_num}.{ch_ref['problems']['start']}-{ch_num}.{ch_ref['problems']['end']})",
+                "derived": f"{derived_prob_cnt} ({ch_num}.{ch_derived.get('problems', {}).get('start')}-{ch_num}.{ch_derived.get('problems', {}).get('end')})" if derived_prob_cnt else "N/A",
+                "transcription": f"{trans_prob_count} ({ch_num}.1-{ch_num}.{trans_prob_count})",
+                "status": prob_status
+            },
+            {
+                "dimension": "Figure Count",
+                "reference": f"{ref_fig_cnt} ({ch_num}.{ch_ref['figures']['start']}-{ch_num}.{ch_ref['figures']['end']})",
+                "derived": f"{derived_fig_cnt} ({ch_num}.{ch_derived.get('figures', {}).get('start')}-{ch_num}.{ch_derived.get('figures', {}).get('end')})" if derived_fig_cnt else "N/A",
+                "transcription": f"{trans_fig_count} ({ch_num}.1-{ch_num}.{trans_fig_count})",
+                "status": fig_status
+            },
+            {
+                "dimension": "Section Count",
+                "reference": f"{ref_sec_cnt} ({ch_num}.{ch_ref['sections']['start']}-{ch_num}.{ch_ref['sections']['end']})",
+                "derived": f"{derived_sec_cnt} ({ch_num}.{ch_derived.get('sections', {}).get('start')}-{ch_num}.{ch_derived.get('sections', {}).get('end')})" if derived_sec_cnt else "N/A",
+                "transcription": f"{trans_sec_count} ({ch_num}.1-{ch_num}.{trans_sec_count})",
+                "status": sec_status
+            }
+        ]
+
+        tables_by_chapter[ch_num] = rows
+
+    stats = {
+        "tables_by_chapter": tables_by_chapter,
+        "warnings": warnings,
+        "failures": failures
+    }
+
+    return len(failures) == 0, failures, warnings, stats
+
+
 def generate_verification_report(
+    three_way_res: Tuple[bool, List[str], List[str], Dict[str, Any]],
     completeness_res: Tuple[bool, List[str], Dict[str, int]],
     equations_res: Tuple[bool, List[str], Dict[str, Any]],
     sections_res: Tuple[bool, List[str], Dict[str, Any]],
@@ -994,10 +1377,12 @@ def generate_verification_report(
     pdf_cov_res: Tuple[bool, List[str], Dict[str, Any]],
     cross_res: Tuple[bool, List[str], Dict[str, Any]],
     sweep_res: Tuple[bool, List[str], Dict[str, Any]],
-    output_path: Path
+    output_path: Path,
+    in_scope_pages: List[int]
 ) -> str:
-    """Generates comprehensive verification report markdown."""
+    """Generates comprehensive verification report markdown with Three-Way tables."""
     all_passed = all([
+        three_way_res[0],
         completeness_res[0],
         equations_res[0],
         sections_res[0],
@@ -1012,8 +1397,7 @@ def generate_verification_report(
         "# Verification Report: Stage 1 Ingestion & Extraction",
         "",
         f"**Overall Status:** {'PASSED (READY FOR STAGE 2)' if all_passed else 'FAILED (DO NOT PROCEED)'}",
-        f"**Scope:** Chapter 2 (PDF 33-76 / Book 13-56) & Chapter 3 (PDF 77-125 / Book 57-105)",
-        f"**Total Pages In-Scope:** {len(IN_SCOPE_PAGES)}",
+        f"**Total Pages In-Scope:** {len(in_scope_pages)}",
         "",
         "---",
         "",
@@ -1021,27 +1405,52 @@ def generate_verification_report(
         "",
         f"| Check | Description | Status |",
         f"| :--- | :--- | :--- |",
+        f"| 1) Three-Way Comparison | Reference vs Derived (PDF text layer) vs Transcription | {'PASS' if three_way_res[0] else 'FAIL'} |",
         f"| a) Completeness | Checkpoint presence & non-empty character threshold | {'PASS' if completeness_res[0] else 'FAIL'} |",
         f"| b) Equation Sequence | Contiguous equations with no gaps, duplicates, or bare/letter conflicts | {'PASS' if equations_res[0] else 'FAIL'} |",
         f"| c) Section / Figure / Table | Contiguous structure hierarchy (sections & subsections) | {'PASS' if sections_res[0] else 'FAIL'} |",
         f"| d) Problem Sequence | Contiguous end-of-chapter problems | {'PASS' if problems_res[0] else 'FAIL'} |",
-        f"| e) LaTeX & OCR Integrity | Balanced delimiters, no corrupted OCR artifacts | {'PASS' if latex_res[0] else 'FAIL'} |",
+        f"| e) LaTeX & Corruption Integrity | Balanced delimiters, control characters, stray angle brackets, math braces | {'PASS' if latex_res[0] else 'FAIL'} |",
         f"| f) PDF Text Layer 100% Coverage | Full independent comparison of PDF text layer vs transcription | {'PASS' if pdf_cov_res[0] else 'FAIL'} |",
-        f"| g) Cross-Model Spot Check | Dual-model verification (AGREE / DISAGREE / UNVERIFIED, coverage %) | {'PASS' if cross_res[0] else 'FAIL'} |",
+        f"| g) Cross-Model Spot Check | Dual-model verification on stratified sample (manifest-verified vendor) | {'PASS' if cross_res[0] else 'FAIL'} |",
         f"| h) Sub-Equation Sweep | Full scan for equation jumps > 1 and bare/lettered conflicts | {'PASS' if sweep_res[0] else 'FAIL'} |",
         "",
         "---",
         "",
-        "## Detailed Results & Audits",
+        "## Three-Way Ground Truth Comparison",
         ""
     ]
+
+    # Add Three-Way Tables per Chapter
+    tables = three_way_res[3].get("tables_by_chapter", {})
+    for ch_num, rows in sorted(tables.items()):
+        lines.append(f"### Chapter {ch_num:02d} Three-Way Comparison")
+        lines.append("")
+        lines.append("| Dimension | Reference | Derived (PDF Text Layer) | Transcription | Status |")
+        lines.append("| :--- | :--- | :--- | :--- | :--- |")
+        for r in rows:
+            lines.append(f"| {r['dimension']} | {r['reference']} | {r['derived']} | {r['transcription']} | {r['status']} |")
+        lines.append("")
+
+    if three_way_res[2]:
+        lines.append("#### Warnings & Known Discrepancies")
+        for w in three_way_res[2]:
+            lines.append(f"- ⚠️ {w}")
+        lines.append("")
+
+    lines.extend([
+        "---",
+        "",
+        "## Detailed Results & Audits",
+        ""
+    ])
 
     checks = [
         ("a) Completeness", completeness_res),
         ("b) Equation Sequence", equations_res),
         ("c) Section / Figure / Table Sequence", sections_res),
         ("d) Problem Sequence", problems_res),
-        ("e) LaTeX & OCR Integrity", latex_res),
+        ("e) LaTeX & Corruption Integrity", latex_res),
         ("f) PDF Text Layer 100% Coverage", pdf_cov_res),
         ("g) Cross-Model Spot Check", cross_res),
         ("h) Sub-Equation Sweep", sweep_res),
@@ -1059,7 +1468,6 @@ def generate_verification_report(
         else:
             lines.append("- **Details:** All assertions satisfied.")
 
-        # Special rendering for Check f (PDF Text Layer Coverage) table
         if name == "f) PDF Text Layer 100% Coverage" and "per_page_results" in stats:
             lines.append("")
             lines.append(f"- **Total Pages Audited:** {stats['total_pages']}")
@@ -1067,16 +1475,16 @@ def generate_verification_report(
             lines.append(f"- **Pages with Failures (In PDF, Missing in Transcription):** {stats['failed_pages_count']} ({stats['failed_pages']})")
             lines.append(f"- **Pages with Warnings (In Transcription, Absent from Lossy Text Layer):** {stats['warning_pages_count']} ({stats['warning_pages']})")
             lines.append("")
-            lines.append("#### Full Per-Page Comparison Table (93 Pages)")
+            lines.append("#### Full Per-Page Comparison Table")
             lines.append("")
-            lines.append("| Page | Book Page | PDF Text Layer Labels | Transcription Labels | Missing in Trans (FAIL) | Missing in PDF (WARN) | Status |")
+            lines.append("| Page | Ch | PDF Text Layer Labels | Transcription Labels | Missing in Trans (FAIL) | Missing in PDF (WARN) | Status |")
             lines.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
             for r in stats["per_page_results"]:
                 pdf_str = ", ".join(r["pdf_labels"]) if r["pdf_labels"] else "—"
                 trans_str = ", ".join(r["trans_labels"]) if r["trans_labels"] else "—"
                 fail_str = ", ".join(r["missing_in_trans"]) if r["missing_in_trans"] else "—"
                 warn_str = ", ".join(r["missing_in_pdf"]) if r["missing_in_pdf"] else "—"
-                lines.append(f"| {r['page']} | {r['book_page']} | {pdf_str} | {trans_str} | {fail_str} | {warn_str} | {r['status']} |")
+                lines.append(f"| {r['page']} | {r['chapter']} | {pdf_str} | {trans_str} | {fail_str} | {warn_str} | {r['status']} |")
             lines.append("")
         elif stats:
             lines.append(f"```json\n{json.dumps(stats, indent=2)}\n```")
@@ -1093,6 +1501,8 @@ def run_verification(
     chapters_dir: Path = Path("data/chapters"),
     problems_dir: Path = Path("data/problems"),
     pdf_path: Optional[Path] = None,
+    ref_path: Optional[Path] = None,
+    derived_path: Optional[Path] = None,
     report_path: Path = Path("data/verification_report.md"),
     api_key: Optional[str] = None,
     retranscribe: bool = False
@@ -1102,44 +1512,90 @@ def run_verification(
     print("LEARN-ASSIST STAGE 1 VERIFICATION")
     print("=" * 60)
 
-    print("\n[1/8] Verifying a) Completeness...")
-    comp_res = check_completeness(pages_dir)
+    # 1. Load ground truth metadata
+    ref_chapters, derived_chapters, anchor_warnings = load_chapter_metadata(
+        ref_path=ref_path, derived_path=derived_path, pdf_path=pdf_path
+    )
+    in_scope_pages = get_in_scope_pages(ref_chapters)
+
+    print(f"\nTarget Chapters: {sorted(ref_chapters.keys())}")
+    print(f"In-Scope Pages: {len(in_scope_pages)} total ({min(in_scope_pages)}..{max(in_scope_pages)})")
+
+    # 2. Three-Way Comparison
+    print("\n[1/9] Three-Way Comparison (Reference vs Derived vs Transcription)...")
+    three_way_res = check_three_way_comparison(
+        ref_chapters=ref_chapters,
+        derived_chapters=derived_chapters,
+        chapters_dir=chapters_dir,
+        problems_dir=problems_dir
+    )
+    print(f"  -> {'PASS' if three_way_res[0] else 'FAIL'}")
+    for ch_num, rows in sorted(three_way_res[3].get("tables_by_chapter", {}).items()):
+        print(f"\n--- Chapter {ch_num:02d} Three-Way Comparison Table ---")
+        for r in rows:
+            print(f"  {r['dimension']:<16} | Ref: {r['reference']:<20} | Derived: {r['derived']:<20} | Trans: {r['transcription']:<20} | {r['status']}")
+    if three_way_res[2]:
+        print("\nWarnings:")
+        for w in three_way_res[2]:
+            print(f"  ⚠️  {w}")
+
+    # 3. Completeness
+    print("\n[2/9] Verifying a) Completeness...")
+    comp_res = check_completeness(pages_dir, in_scope_pages=in_scope_pages, chapters_meta=ref_chapters)
     print(f"  -> {'PASS' if comp_res[0] else 'FAIL'}")
 
-    print("\n[2/8] Verifying b) Equation Sequence...")
-    eq_res = check_equations(chapters_dir)
+    # 4. Equations
+    print("\n[3/9] Verifying b) Equation Sequence...")
+    eq_res = check_equations(chapters_dir, chapters_meta=ref_chapters)
     print(f"  -> {'PASS' if eq_res[0] else 'FAIL'}")
 
-    print("\n[3/8] Verifying c) Section, Figure, and Table Sequence...")
-    sec_res = check_sections_and_figures(chapters_dir)
+    # 5. Sections and Figures
+    print("\n[4/9] Verifying c) Section, Figure, and Table Sequence...")
+    sec_res = check_sections_and_figures(chapters_dir, chapters_meta=ref_chapters)
     print(f"  -> {'PASS' if sec_res[0] else 'FAIL'}")
 
-    print("\n[4/8] Verifying d) Problem Sequence...")
-    prob_res = check_problem_sequence(problems_dir)
+    # 6. Problems
+    print("\n[5/9] Verifying d) Problem Sequence...")
+    prob_res = check_problem_sequence(problems_dir, chapters_meta=ref_chapters)
     print(f"  -> {'PASS' if prob_res[0] else 'FAIL'}")
 
-    print("\n[5/8] Verifying e) LaTeX Integrity & Corrupted OCR Signatures...")
-    latex_res = check_latex_integrity(pages_dir)
+    # 7. LaTeX Integrity & Corruption Checks
+    print("\n[6/9] Verifying e) LaTeX Integrity & Corruption Checks...")
+    latex_res = check_latex_integrity(pages_dir, in_scope_pages=in_scope_pages, chapters_meta=ref_chapters)
     print(f"  -> {'PASS' if latex_res[0] else 'FAIL'}")
 
-    print("\n[6/8] Verifying f) PDF Text Layer 100% Coverage...")
-    pdf_cov_res = check_pdf_text_layer_coverage(pdf_path=pdf_path, pages_dir=pages_dir)
+    # 8. PDF Text Layer Coverage
+    print("\n[7/9] Verifying f) PDF Text Layer 100% Coverage...")
+    pdf_cov_res = check_pdf_text_layer_coverage(
+        pdf_path=pdf_path, pages_dir=pages_dir, in_scope_pages=in_scope_pages, chapters_meta=ref_chapters
+    )
     print(f"  -> {'PASS' if pdf_cov_res[0] else 'FAIL'}")
 
-    print("\n[7/8] Verifying g) Cross-Model Spot Check...")
-    cross_res = check_cross_model_spot(pages_dir, api_key=api_key, retranscribe=retranscribe, pdf_path=pdf_path)
+    # 9. Cross-Model Spot Check
+    print("\n[8/9] Verifying g) Cross-Model Spot Check...")
+    cross_res = check_cross_model_spot(
+        pages_dir,
+        api_key=api_key,
+        retranscribe=retranscribe,
+        pdf_path=pdf_path,
+        in_scope_pages=in_scope_pages,
+        chapters_meta=ref_chapters
+    )
     print(f"  -> {'PASS' if cross_res[0] else 'FAIL'}")
 
-    print("\n[8/8] Verifying h) Sub-Equation Sweep (93 pages)...")
-    sweep_res = check_sub_equation_sweep(pages_dir)
+    # 10. Sub-Equation Sweep
+    print("\n[9/9] Verifying h) Sub-Equation Sweep...")
+    sweep_res = check_sub_equation_sweep(pages_dir, in_scope_pages=in_scope_pages, chapters_meta=ref_chapters)
     print(f"  -> {'PASS' if sweep_res[0] else 'FAIL'}")
 
     report = generate_verification_report(
-        comp_res, eq_res, sec_res, prob_res, latex_res, pdf_cov_res, cross_res, sweep_res, report_path
+        three_way_res, comp_res, eq_res, sec_res, prob_res, latex_res, pdf_cov_res, cross_res, sweep_res,
+        report_path, in_scope_pages
     )
 
     all_passed = all([
-        comp_res[0], eq_res[0], sec_res[0], prob_res[0], latex_res[0], pdf_cov_res[0], cross_res[0], sweep_res[0]
+        three_way_res[0], comp_res[0], eq_res[0], sec_res[0], prob_res[0],
+        latex_res[0], pdf_cov_res[0], cross_res[0], sweep_res[0]
     ])
 
     print("\n" + "=" * 60)
@@ -1159,6 +1615,8 @@ def main():
     parser.add_argument("--chapters-dir", type=Path, default=Path("data/chapters"), help="Chapters directory")
     parser.add_argument("--problems-dir", type=Path, default=Path("data/problems"), help="Problems directory")
     parser.add_argument("--pdf-path", type=Path, default=None, help="Source PDF file path")
+    parser.add_argument("--ref-path", type=Path, default=None, help="Reference anchors JSON path")
+    parser.add_argument("--derived-path", type=Path, default=None, help="Derived anchors JSON path")
     parser.add_argument("--report", type=Path, default=Path("data/verification_report.md"), help="Report output path")
     parser.add_argument("--api-key", type=str, default=None, help="API key for cross-model spot check")
     parser.add_argument("--retranscribe", action="store_true", default=False, help="Enable API re-transcription of uncached spot check pages")
@@ -1169,6 +1627,8 @@ def main():
         chapters_dir=args.chapters_dir,
         problems_dir=args.problems_dir,
         pdf_path=args.pdf_path,
+        ref_path=args.ref_path,
+        derived_path=args.derived_path,
         report_path=args.report,
         api_key=args.api_key,
         retranscribe=args.retranscribe

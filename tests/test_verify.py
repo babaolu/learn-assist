@@ -1,5 +1,5 @@
 """
-Unit tests for the verification suite in learn_assist.verify.
+Unit tests for the verification suite in learn_assist.verify and learn_assist.anchors.
 Tests check logic using synthetic fixtures with deliberate faults:
 - Missing and empty checkpoint pages
 - Equation gaps and unexpected numbers
@@ -7,13 +7,17 @@ Tests check logic using synthetic fixtures with deliberate faults:
 - Equation numbers in parentheses that must not be read as sections
 - Real structure of Page 50: reports section 2.5.2 and NOT sections 75-80
 - Cross-model outcomes: AGREE, DISAGREE, and UNVERIFIED (timeouts must NOT be agreement or disagreement)
+- Cross-model vendor verification: same-vendor cross-transcriptions stop counting toward coverage
 - Sub-equation sweep: catches equation jumps > 1 and bare labels where lettered exist
 - Section and subsection hierarchy contiguity
 - Problem sequence gaps and duplicates
 - Unbalanced LaTeX math delimiters ($ and $$)
-- Corrupted OCR artifact signatures
+- Corruption checks: Unicode replacement character, control characters, stray angle brackets outside LaTeX, unbalanced math braces
+- Three-way comparison checks: truncation, invented content, derived lossy gap with WARN, missing reference fallback
+- Chapter start detection: distinguishes "Chapter 3" from "58 Chapter 3"
 """
 
+import json
 import pytest
 from pathlib import Path
 from learn_assist.verify import (
@@ -28,22 +32,26 @@ from learn_assist.verify import (
     check_cross_model_spot,
     check_sub_equation_sweep,
     check_pdf_text_layer_coverage,
+    check_three_way_comparison,
     extract_equation_labels,
     extract_equation_numbers,
     extract_section_headings,
     extract_pdf_text_labels,
     select_stratified_sample,
-    CORRUPT_OCR_PATTERNS,
+    check_braces_balanced,
+    check_stray_angle_brackets,
 )
+from learn_assist.anchors import is_chapter_start
 
 
 def test_completeness_passes_when_all_present(tmp_path: Path):
     pages_dir = tmp_path / "pages"
     pages_dir.mkdir()
-    for p in range(33, 126):
+    pages = list(range(33, 126))
+    for p in pages:
         (pages_dir / f"page_{p:04d}.md").write_text("Valid page content with sufficient characters. " * 10)
 
-    passed, failures, counts = check_completeness(pages_dir, min_chars=100)
+    passed, failures, counts = check_completeness(pages_dir, in_scope_pages=pages, min_chars=100)
     assert passed is True
     assert len(failures) == 0
     assert len(counts) == 93
@@ -52,7 +60,8 @@ def test_completeness_passes_when_all_present(tmp_path: Path):
 def test_completeness_catches_missing_and_empty_pages(tmp_path: Path):
     pages_dir = tmp_path / "pages"
     pages_dir.mkdir()
-    for p in range(33, 126):
+    pages = list(range(33, 126))
+    for p in pages:
         if p == 45:
             continue
         elif p == 50:
@@ -62,7 +71,7 @@ def test_completeness_catches_missing_and_empty_pages(tmp_path: Path):
         else:
             (pages_dir / f"page_{p:04d}.md").write_text("Valid content. " * 20)
 
-    passed, failures, counts = check_completeness(pages_dir, min_chars=50)
+    passed, failures, counts = check_completeness(pages_dir, in_scope_pages=pages, min_chars=50)
     assert passed is False
     assert any("45" in f and "MISSING" in f for f in failures)
     assert any("50" in f and "EMPTY" in f for f in failures)
@@ -120,7 +129,6 @@ def test_equation_sequence_passes_valid_lettered():
 
 
 def test_equation_sequence_catches_bare_and_lettered_conflict():
-    # Base 3 appears both bare and with letter suffix 'a'
     faulty_labels = [
         (1, "", "2.1", 1, ""),
         (2, "", "2.2", 2, ""),
@@ -133,7 +141,6 @@ def test_equation_sequence_catches_bare_and_lettered_conflict():
 
 
 def test_equation_sequence_catches_letter_suffix_gap():
-    # Base 2 has 'a' and 'c' (missing 'b')
     gap_labels = [
         (1, "", "2.1", 1, ""),
         (2, "a", "2.2a", 2, ""),
@@ -144,7 +151,6 @@ def test_equation_sequence_catches_letter_suffix_gap():
     assert passed is False
     assert any("Letter suffix gap" in f for f in fails)
 
-    # Base 2 starts at 'b' (missing 'a')
     no_a_labels = [
         (1, "", "2.1", 1, ""),
         (2, "b", "2.2b", 2, ""),
@@ -156,7 +162,6 @@ def test_equation_sequence_catches_letter_suffix_gap():
 
 
 def test_equation_sequence_catches_duplicates():
-    # Duplicate bare definition for 2.2
     dup_bare = [
         (1, "", "2.1", 1, ""),
         (2, "", "2.2", 2, ""),
@@ -167,7 +172,6 @@ def test_equation_sequence_catches_duplicates():
     assert passed is False
     assert any("Duplicate bare definition" in f for f in fails)
 
-    # Duplicate letter suffix 'a' for 2.2
     dup_letter = [
         (1, "", "2.1", 1, ""),
         (2, "a", "2.2a", 2, ""),
@@ -195,12 +199,6 @@ def test_equation_parentheses_not_read_as_section():
 
 
 def test_page_50_fixture_structure():
-    """
-    Synthetic fixture matching page 50's real content:
-    - Must report section 2.5.2
-    - Must NOT report sections 75-80
-    - Must extract equations (2.75), (2.76), (2.77), (2.78), (2.79a), (2.79b), (2.80a), (2.80b)
-    """
     page_50_fixture = r"""
     # Chapter 2 Mathematical Fundamentals
 
@@ -253,19 +251,16 @@ def test_page_50_fixture_structure():
 
 
 def test_section_hierarchy_contiguity():
-    # Good hierarchy
     good_headings = ["2.1", "2.2", "2.3", "2.3.1", "2.3.2", "2.4"]
     passed, fails, stats = check_section_hierarchy(good_headings, 2, range(1, 5))
     assert passed is True
     assert len(fails) == 0
 
-    # Gap in Level 1 (missing 2.3)
     gap_l1 = ["2.1", "2.2", "2.4"]
     passed_l1, fails_l1, _ = check_section_hierarchy(gap_l1, 2, range(1, 5))
     assert passed_l1 is False
     assert any("Missing Level 1" in f and "3" in f for f in fails_l1)
 
-    # Gap in Level 2 (2.3 has 2.3.1 and 2.3.3, missing 2.3.2)
     gap_l2 = ["2.1", "2.2", "2.3", "2.3.1", "2.3.3", "2.4"]
     passed_l2, fails_l2, _ = check_section_hierarchy(gap_l2, 2, range(1, 5))
     assert passed_l2 is False
@@ -276,24 +271,20 @@ def test_sub_equation_sweep_detects_jumps_and_conflicts(tmp_path: Path):
     pages_dir = tmp_path / "pages"
     pages_dir.mkdir()
 
-    # Create 3 pages:
-    # Page 33: Equation 2.1, 2.2
-    # Page 34: Equation 2.3, 2.6 (internal jump from 3 to 6)
-    # Page 35: Equation 2.7
     (pages_dir / "page_0033.md").write_text(r"$$ x = 1 \quad (2.1) $$ $$ x = 2 \quad (2.2) $$")
     (pages_dir / "page_0034.md").write_text(r"$$ x = 3 \quad (2.3) $$ $$ x = 6 \quad (2.6) $$")
     (pages_dir / "page_0035.md").write_text(r"$$ x = 7 \quad (2.7) $$")
 
-    passed, failures, stats = check_sub_equation_sweep(pages_dir, in_scope_pages=[33, 34, 35])
+    meta = {2: {"chapter_start": {"value": 33}, "chapter_end": {"value": 35}}}
+    passed, failures, stats = check_sub_equation_sweep(pages_dir, in_scope_pages=[33, 34, 35], chapters_meta=meta)
     assert passed is False
     assert 34 in stats["flagged_pages"]
     assert any("Page 34" in f and "jumps internally" in f and "3 to 2.6" in f for f in failures)
 
-    # Test bare where lettered exists elsewhere:
-    # Page 36 has bare (2.8), but Page 37 has (2.8a) and (2.8b)
     (pages_dir / "page_0036.md").write_text(r"$$ x = 8 \quad (2.8) $$")
     (pages_dir / "page_0037.md").write_text(r"$$ x = 8 \quad (2.8a) $$ $$ x = 9 \quad (2.8b) $$")
-    passed_b, fails_b, stats_b = check_sub_equation_sweep(pages_dir, in_scope_pages=[36, 37])
+    meta2 = {2: {"chapter_start": {"value": 36}, "chapter_end": {"value": 37}}}
+    passed_b, fails_b, stats_b = check_sub_equation_sweep(pages_dir, in_scope_pages=[36, 37], chapters_meta=meta2)
     assert passed_b is False
     assert 36 in stats_b["flagged_pages"]
     assert any("Page 36" in f and "appears bare, but base 2.8 appears with letter suffixes" in f for f in fails_b)
@@ -305,37 +296,39 @@ def test_cross_model_classifies_agree_disagree_unverified(tmp_path: Path):
     cross_dir = tmp_path / "cross_model"
     cross_dir.mkdir()
 
-    # Mock primary page 40 and cross page 40 (AGREE)
+    # Primary pages
     (pages_dir / "page_0040.md").write_text(r"## 2.1 Intro $$ y = 1 \quad (2.1) $$")
-    (cross_dir / "page_0040_cross.md").write_text(r"## 2.1 Intro $$ y = 1 \quad (2.1) $$")
-
-    # Mock primary page 41 and cross page 41 (DISAGREE on equations)
     (pages_dir / "page_0041.md").write_text(r"## 2.2 Methods $$ y = 2 \quad (2.2a) $$")
-    (cross_dir / "page_0041_cross.md").write_text(r"## 2.2 Methods $$ y = 2 \quad (2.2) $$")
-
-    # Mock primary page 42 with NO cross file (UNVERIFIED)
     (pages_dir / "page_0042.md").write_text(r"## 2.3 Results $$ y = 3 \quad (2.3) $$")
 
-    import learn_assist.verify as vmod
-    orig_scope = vmod.IN_SCOPE_PAGES
-    try:
-        vmod.IN_SCOPE_PAGES = [40, 41, 42]
-        passed, failures, stats = check_cross_model_spot(
-            pages_dir=pages_dir,
-            sampled_pages=[40, 41, 42],
-            retranscribe=False,
-            cross_dir=cross_dir
-        )
-        assert passed is False  # Coverage failure because 42 is UNVERIFIED and 41 is DISAGREE
-        status_by_page = {r["page"]: r["status"] for r in stats["results"]}
-        assert status_by_page[40] == "AGREE"
-        assert status_by_page[41] == "DISAGREE"
-        assert status_by_page[42] == "UNVERIFIED"
-        assert stats["agreed_count"] == 1
-        assert stats["disagreed_count"] == 1
-        assert stats["unverified_count"] == 1
-    finally:
-        vmod.IN_SCOPE_PAGES = orig_scope
+    # Cross pages (from non-Google vendor e.g. Anthropic)
+    (cross_dir / "page_0040_cross.md").write_text(r"## 2.1 Intro $$ y = 1 \quad (2.1) $$")
+    (cross_dir / "page_0041_cross.md").write_text(r"## 2.2 Methods $$ y = 2 \quad (2.2) $$")
+
+    manifest = {
+        "page_0040": {"vendor": "anthropic", "model": "claude-3-5-sonnet"},
+        "page_0041": {"vendor": "anthropic", "model": "claude-3-5-sonnet"}
+    }
+    (cross_dir / "manifest.json").write_text(json.dumps(manifest))
+
+    meta = {2: {"chapter_start": {"value": 40}, "chapter_end": {"value": 42}}}
+    passed, failures, stats = check_cross_model_spot(
+        pages_dir=pages_dir,
+        sampled_pages=[40, 41, 42],
+        retranscribe=False,
+        cross_dir=cross_dir,
+        in_scope_pages=[40, 41, 42],
+        chapters_meta=meta,
+        primary_vendor="google"
+    )
+    assert passed is False  # Coverage failure because 42 is UNVERIFIED and 41 is DISAGREE
+    status_by_page = {r["page"]: r["status"] for r in stats["results"]}
+    assert status_by_page[40] == "AGREE"
+    assert status_by_page[41] == "DISAGREE"
+    assert status_by_page[42] == "UNVERIFIED"
+    assert stats["agreed_count"] == 1
+    assert stats["disagreed_count"] == 1
+    assert stats["unverified_count"] == 1
 
 
 def test_cross_model_timeout_is_unverified_not_agreement_or_disagreement(tmp_path: Path):
@@ -345,94 +338,351 @@ def test_cross_model_timeout_is_unverified_not_agreement_or_disagreement(tmp_pat
     cross_dir.mkdir()
     (pages_dir / "page_0050.md").write_text(r"$$ x = 1 \quad (2.1) $$")
 
-    import learn_assist.verify as vmod
-    orig_scope = vmod.IN_SCOPE_PAGES
-    try:
-        vmod.IN_SCOPE_PAGES = [50]
-        # When retranscribe=False and cross file does not exist, status is UNVERIFIED (never AGREE or DISAGREE)
-        passed, failures, stats = check_cross_model_spot(
-            pages_dir=pages_dir,
-            sampled_pages=[50],
-            retranscribe=False,
-            cross_dir=cross_dir
-        )
-        assert passed is False  # Coverage failure because page is UNVERIFIED
-        results = stats["results"]
-        assert len(results) == 1
-        res = results[0]
-        assert res["status"] == "UNVERIFIED"
-        assert res["status"] != "AGREE"
-        assert res["status"] != "DISAGREE"
-        assert stats["unverified_count"] == 1
-        assert stats["agreed_count"] == 0
-        assert stats["disagreed_count"] == 0
-    finally:
-        vmod.IN_SCOPE_PAGES = orig_scope
+    meta = {2: {"chapter_start": {"value": 50}, "chapter_end": {"value": 50}}}
+    passed, failures, stats = check_cross_model_spot(
+        pages_dir=pages_dir,
+        sampled_pages=[50],
+        retranscribe=False,
+        cross_dir=cross_dir,
+        in_scope_pages=[50],
+        chapters_meta=meta
+    )
+    assert passed is False  # Coverage failure because page is UNVERIFIED
+    results = stats["results"]
+    assert len(results) == 1
+    res = results[0]
+    assert res["status"] == "UNVERIFIED"
+    assert res["status"] != "AGREE"
+    assert res["status"] != "DISAGREE"
+    assert stats["unverified_count"] == 1
+    assert stats["agreed_count"] == 0
+    assert stats["disagreed_count"] == 0
+
+
+def test_cross_model_same_vendor_does_not_count_toward_coverage(tmp_path: Path):
+    """
+    Requirement 6: Cross-transcriptions from the same vendor as primary (e.g. Gemma from Google)
+    stop counting toward coverage.
+    """
+    pages_dir = tmp_path / "pages"
+    pages_dir.mkdir()
+    cross_dir = tmp_path / "cross_model"
+    cross_dir.mkdir()
+
+    (pages_dir / "page_0046.md").write_text(r"$$ x = 1 \quad (2.1) $$")
+    (cross_dir / "page_0046_cross.md").write_text(r"$$ x = 1 \quad (2.1) $$")
+
+    # Manifest records vendor as google (same as primary)
+    manifest = {
+        "page_0046": {"vendor": "google", "model": "gemma-4-31b-it"}
+    }
+    (cross_dir / "manifest.json").write_text(json.dumps(manifest))
+
+    meta = {2: {"chapter_start": {"value": 46}, "chapter_end": {"value": 46}}}
+    passed, failures, stats = check_cross_model_spot(
+        pages_dir=pages_dir,
+        sampled_pages=[46],
+        retranscribe=False,
+        cross_dir=cross_dir,
+        in_scope_pages=[46],
+        chapters_meta=meta,
+        primary_vendor="google"
+    )
+    assert passed is False
+    assert stats["results"][0]["status"] == "UNVERIFIED"
+    assert "matches primary vendor" in stats["results"][0]["reason"]
+    assert stats["achieved_coverage_pct"] == 0.0
 
 
 def test_problem_sequence_catches_gaps_and_duplicates(tmp_path: Path):
     problems_dir = tmp_path / "problems"
     problems_dir.mkdir()
 
-    # Good chapter 2: 1..32
     good_ch2 = [{"item_number": i, "number": f"2.{i}", "full_text": f"Problem 2.{i}"} for i in range(1, 33)]
-    (problems_dir / "chapter_02.json").write_text(__import__("json").dumps(good_ch2))
+    (problems_dir / "chapter_02.json").write_text(json.dumps(good_ch2))
 
-    # Bad chapter 3: missing 5, duplicate 10
     bad_ch3 = [{"item_number": i, "number": f"3.{i}", "full_text": f"Problem 3.{i}"} for i in range(1, 42) if i != 5]
     bad_ch3.append({"item_number": 10, "number": "3.10", "full_text": "Duplicate problem 3.10"})
-    (problems_dir / "chapter_03.json").write_text(__import__("json").dumps(bad_ch3))
+    (problems_dir / "chapter_03.json").write_text(json.dumps(bad_ch3))
 
-    passed, failures, stats = check_problem_sequence(problems_dir)
+    meta = {
+        2: {"problems": {"start": 1, "end": 32}},
+        3: {"problems": {"start": 1, "end": 41}}
+    }
+    passed, failures, stats = check_problem_sequence(problems_dir, chapters_meta=meta)
     assert passed is False
     assert any("Chapter 03" in f and "Missing" in f and "5" in f for f in failures)
     assert any("Chapter 03" in f and "Duplicate" in f and "10" in f for f in failures)
 
 
-def test_latex_integrity_catches_unbalanced_delimiters(tmp_path: Path):
+# -----------------------------------------------------------------------------
+# Requirement 5b: Corruption Class Checks
+# -----------------------------------------------------------------------------
+
+def test_latex_integrity_clean_page_passes(tmp_path: Path):
     pages_dir = tmp_path / "pages"
     pages_dir.mkdir()
-
-    for p in range(33, 126):
-        (pages_dir / f"page_{p:04d}.md").write_text("Normal content with $x = 1$ and $$y = 2$$.")
-
-    (pages_dir / "page_0040.md").write_text("Unbalanced inline $x = 1 without closing.")
-    (pages_dir / "page_0041.md").write_text("Unbalanced display $$E = mc^2 without closing.")
-
-    passed, failures, stats = check_latex_integrity(pages_dir)
-    assert passed is False
-    assert any("Page 40" in f and "Unbalanced inline $" in f for f in failures)
-    assert any("Page 41" in f and "Unbalanced $$" in f for f in failures)
+    (pages_dir / "page_0033.md").write_text(
+        "Clean markdown page with inline math $x = 1$ and display math:\n$$ y = \\frac{1}{2} $$\nValid."
+    )
+    passed, failures, stats = check_latex_integrity(pages_dir, in_scope_pages=[33])
+    assert passed is True
+    assert len(failures) == 0
 
 
-def test_latex_integrity_catches_corrupted_ocr_signatures(tmp_path: Path):
+def test_latex_integrity_catches_unicode_replacement_character(tmp_path: Path):
     pages_dir = tmp_path / "pages"
     pages_dir.mkdir()
-
-    for p in range(33, 126):
-        (pages_dir / f"page_{p:04d}.md").write_text("Clean mathematical text.")
-
-    (pages_dir / "page_0061.md").write_text("Here we have {R2p}(q, (f>,z) and fi2 corrupted.")
-
-    passed, failures, stats = check_latex_integrity(pages_dir)
+    (pages_dir / "page_0033.md").write_text("Text with corrupted char \ufffd here.")
+    passed, failures, _ = check_latex_integrity(pages_dir, in_scope_pages=[33])
     assert passed is False
-    assert any("Page 61" in f and "(f>" in f for f in failures)
-    assert any("Page 61" in f and "fi2" in f for f in failures)
-    assert any("Page 61" in f and "{R2p}" in f for f in failures)
+    assert any("Unicode replacement character" in f for f in failures)
+
+
+def test_latex_integrity_catches_control_characters(tmp_path: Path):
+    pages_dir = tmp_path / "pages"
+    pages_dir.mkdir()
+    (pages_dir / "page_0033.md").write_text("Text with null byte \x00 and bell \x07.")
+    passed, failures, _ = check_latex_integrity(pages_dir, in_scope_pages=[33])
+    assert passed is False
+    assert any("Control characters detected" in f for f in failures)
+
+
+def test_latex_integrity_catches_stray_angle_bracket_digraph(tmp_path: Path):
+    pages_dir = tmp_path / "pages"
+    pages_dir.mkdir()
+    # <t> outside LaTeX should fail
+    (pages_dir / "page_0033.md").write_text("Corrupted signal s<t> in prose.")
+    passed, failures, _ = check_latex_integrity(pages_dir, in_scope_pages=[33])
+    assert passed is False
+    assert any("Stray angle-bracket digraph" in f for f in failures)
+
+    # But <t> or inequality inside LaTeX math is valid
+    (pages_dir / "page_0034.md").write_text("Valid inside math: $$ s<t> = 1 $$ and $a < b$.")
+    passed_m, failures_m, _ = check_latex_integrity(pages_dir, in_scope_pages=[34])
+    assert passed_m is True
+    assert len(failures_m) == 0
+
+
+def test_latex_integrity_catches_unbalanced_braces_in_math(tmp_path: Path):
+    pages_dir = tmp_path / "pages"
+    pages_dir.mkdir()
+    (pages_dir / "page_0033.md").write_text(r"$$ \frac{1}{2 $$")
+    passed, failures, _ = check_latex_integrity(pages_dir, in_scope_pages=[33])
+    assert passed is False
+    assert any("Unbalanced braces" in f for f in failures)
+
+    # Escaped \{ and \} do not trigger failure
+    (pages_dir / "page_0034.md").write_text(r"$$ \{ x \mid x > 0 \} $$")
+    passed_esc, failures_esc, _ = check_latex_integrity(pages_dir, in_scope_pages=[34])
+    assert passed_esc is True
+    assert len(failures_esc) == 0
 
 
 def test_latex_integrity_catches_mid_word_start(tmp_path: Path):
     pages_dir = tmp_path / "pages"
     pages_dir.mkdir()
-
-    for p in range(33, 126):
-        (pages_dir / f"page_{p:04d}.md").write_text("Properly capitalized start.")
-
     (pages_dir / "page_0070.md").write_text("-cession of the nuclei around the magnetic field.")
-
-    passed, failures, stats = check_latex_integrity(pages_dir)
+    passed, failures, stats = check_latex_integrity(pages_dir, in_scope_pages=[70])
     assert passed is False
     assert any("Page 70" in f and "mid-word" in f for f in failures)
+
+
+# -----------------------------------------------------------------------------
+# Requirement 4: Synthetic Fixture Tests for Three-Way Comparison & Chapter Start
+# -----------------------------------------------------------------------------
+
+def test_three_way_transcription_truncation_fails(tmp_path: Path):
+    """Transcription ends at 3.152, reference says 3.154 → FAIL (truncation)."""
+    ch_dir = tmp_path / "chapters"
+    ch_dir.mkdir()
+    prob_dir = tmp_path / "problems"
+    prob_dir.mkdir()
+
+    # Transcription ends at 3.152
+    ch3_text = "\n".join([f"$$ x = {i} \\quad (3.{i}) $$" for i in range(1, 153)])
+    ch3_text += "\n## 3.1 Sec 1\nFigure 3.1\n"
+    (ch_dir / "chapter_03.md").write_text(ch3_text)
+
+    probs = [{"item_number": i} for i in range(1, 42)]
+    (prob_dir / "chapter_03.json").write_text(json.dumps(probs))
+
+    ref = {
+        3: {
+            "chapter_start": {"value": 77},
+            "chapter_end": {"value": 125},
+            "exercises_start": {"value": 121},
+            "last_equation": {"value": 154, "label": "3.154", "page": 120},
+            "problems": {"start": 1, "end": 41, "count": 41},
+            "figures": {"start": 1, "end": 1, "count": 1},
+            "sections": {"start": 1, "end": 1, "count": 1}
+        }
+    }
+    derived = {
+        3: {
+            "chapter_start": {"value": 77},
+            "chapter_end": {"value": 125},
+            "exercises_start": {"value": 121},
+            "last_equation": {"value": 153, "label": "3.153", "page": 120},
+            "problems": {"start": 1, "end": 41, "count": 41},
+            "figures": {"start": 1, "end": 1, "count": 1},
+            "sections": {"start": 1, "end": 1, "count": 1}
+        }
+    }
+
+    passed, failures, warnings, stats = check_three_way_comparison(
+        ref_chapters=ref,
+        derived_chapters=derived,
+        chapters_dir=ch_dir,
+        problems_dir=prob_dir
+    )
+    assert passed is False
+    assert any("Truncation" in f and "152" in f and "154" in f for f in failures)
+
+
+def test_three_way_transcription_invented_content_fails(tmp_path: Path):
+    """Transcription has 3.155 beyond reference 3.154 → FAIL (invented content)."""
+    ch_dir = tmp_path / "chapters"
+    ch_dir.mkdir()
+    prob_dir = tmp_path / "problems"
+    prob_dir.mkdir()
+
+    # Transcription has 3.155
+    ch3_text = "\n".join([f"$$ x = {i} \\quad (3.{i}) $$" for i in range(1, 156)])
+    ch3_text += "\n## 3.1 Sec 1\nFigure 3.1\n"
+    (ch_dir / "chapter_03.md").write_text(ch3_text)
+
+    probs = [{"item_number": i} for i in range(1, 42)]
+    (prob_dir / "chapter_03.json").write_text(json.dumps(probs))
+
+    ref = {
+        3: {
+            "chapter_start": {"value": 77},
+            "chapter_end": {"value": 125},
+            "exercises_start": {"value": 121},
+            "last_equation": {"value": 154, "label": "3.154", "page": 120},
+            "problems": {"start": 1, "end": 41, "count": 41},
+            "figures": {"start": 1, "end": 1, "count": 1},
+            "sections": {"start": 1, "end": 1, "count": 1}
+        }
+    }
+    derived = {
+        3: {
+            "chapter_start": {"value": 77},
+            "chapter_end": {"value": 125},
+            "exercises_start": {"value": 121},
+            "last_equation": {"value": 153, "label": "3.153", "page": 120},
+            "problems": {"start": 1, "end": 41, "count": 41},
+            "figures": {"start": 1, "end": 1, "count": 1},
+            "sections": {"start": 1, "end": 1, "count": 1}
+        }
+    }
+
+    passed, failures, warnings, stats = check_three_way_comparison(
+        ref_chapters=ref,
+        derived_chapters=derived,
+        chapters_dir=ch_dir,
+        problems_dir=prob_dir
+    )
+    assert passed is False
+    assert any("Invented content" in f and "155" in f and "154" in f for f in failures)
+
+
+def test_three_way_derived_gap_warns_not_fails(tmp_path: Path):
+    """Derived 3.153, reference and transcription 3.154 → PASS with WARN recorded."""
+    ch_dir = tmp_path / "chapters"
+    ch_dir.mkdir()
+    prob_dir = tmp_path / "problems"
+    prob_dir.mkdir()
+
+    # Transcription has 3.154 (matches reference)
+    ch3_text = "\n".join([f"$$ x = {i} \\quad (3.{i}) $$" for i in range(1, 155)])
+    ch3_text += "\n## 3.1 Sec 1\nFigure 3.1\n"
+    (ch_dir / "chapter_03.md").write_text(ch3_text)
+
+    probs = [{"item_number": i} for i in range(1, 42)]
+    (prob_dir / "chapter_03.json").write_text(json.dumps(probs))
+
+    ref = {
+        3: {
+            "chapter_start": {"value": 77},
+            "chapter_end": {"value": 125},
+            "exercises_start": {"value": 121},
+            "last_equation": {"value": 154, "label": "3.154", "page": 120},
+            "problems": {"start": 1, "end": 41, "count": 41},
+            "figures": {"start": 1, "end": 1, "count": 1},
+            "sections": {"start": 1, "end": 1, "count": 1}
+        }
+    }
+    derived = {
+        3: {
+            "chapter_start": {"value": 77},
+            "chapter_end": {"value": 125},
+            "exercises_start": {"value": 121},
+            "last_equation": {"value": 153, "label": "3.153", "page": 120},
+            "problems": {"start": 1, "end": 41, "count": 41},
+            "figures": {"start": 1, "end": 1, "count": 1},
+            "sections": {"start": 1, "end": 1, "count": 1}
+        }
+    }
+
+    passed, failures, warnings, stats = check_three_way_comparison(
+        ref_chapters=ref,
+        derived_chapters=derived,
+        chapters_dir=ch_dir,
+        problems_dir=prob_dir
+    )
+    assert passed is True
+    assert len(failures) == 0
+    assert len(warnings) == 1
+    assert any("PDF 120" in w and "153" in w and "154" in w for w in warnings)
+
+
+def test_three_way_reference_absent_falls_back_to_derived(tmp_path: Path):
+    """Reference absent for a chapter → falls back to derived, flagged loudly."""
+    ch_dir = tmp_path / "chapters"
+    ch_dir.mkdir()
+    prob_dir = tmp_path / "problems"
+    prob_dir.mkdir()
+
+    ch4_text = "$$ x = 1 \\quad (4.1) $$\n## 4.1 Sec 1\nFigure 4.1\n"
+    (ch_dir / "chapter_04.md").write_text(ch4_text)
+    (prob_dir / "chapter_04.json").write_text(json.dumps([{"item_number": 1}]))
+
+    # Empty reference, derived provided for Chapter 4
+    ref = {}
+    derived = {
+        4: {
+            "chapter_start": {"value": 127},
+            "chapter_end": {"value": 160},
+            "exercises_start": {"value": 158},
+            "last_equation": {"value": 1, "label": "4.1", "page": 157},
+            "problems": {"start": 1, "end": 1, "count": 1},
+            "figures": {"start": 1, "end": 1, "count": 1},
+            "sections": {"start": 1, "end": 1, "count": 1}
+        }
+    }
+
+    passed, failures, warnings, stats = check_three_way_comparison(
+        ref_chapters=ref,
+        derived_chapters=derived,
+        chapters_dir=ch_dir,
+        problems_dir=prob_dir
+    )
+    assert passed is True
+    assert any("No reference file available" in w and "Chapter 04" in w for w in warnings)
+
+
+def test_chapter_start_detection():
+    """Chapter-start detection distinguishes 'Chapter 3' from '58 Chapter 3'."""
+    start_text = "Chapter 3\nSignal Generation and Detection\nIntro text..."
+    header_text = "58 Chapter 3 Signal Generation and Detection\nBody text on interior page..."
+    header_num_only = "58\nChapter 3 Signal Generation and Detection\nBody text..."
+
+    assert is_chapter_start(start_text, 3) is True
+    assert is_chapter_start(header_text, 3) is False
+    assert is_chapter_start(header_num_only, 3) is False
+    assert is_chapter_start("Chapter 2\nMath fundamentals", 3) is False
 
 
 def test_pdf_text_layer_coverage_catches_missing_in_transcription(tmp_path: Path):
@@ -447,13 +697,14 @@ def test_pdf_text_layer_coverage_catches_missing_in_transcription(tmp_path: Path
 
     pages_dir = tmp_path / "pages"
     pages_dir.mkdir()
-    # Transcribe page 33 without (2.1)
     (pages_dir / "page_0033.md").write_text("Formula here without tag.")
 
+    meta = {2: {"chapter_start": {"value": 33}, "chapter_end": {"value": 33}}}
     passed, failures, stats = check_pdf_text_layer_coverage(
         pdf_path=pdf_path,
         pages_dir=pages_dir,
-        in_scope_pages=[33]
+        in_scope_pages=[33],
+        chapters_meta=meta
     )
     assert passed is False
     assert len(failures) == 1
@@ -473,13 +724,14 @@ def test_pdf_text_layer_coverage_warns_when_missing_in_pdf(tmp_path: Path):
 
     pages_dir = tmp_path / "pages"
     pages_dir.mkdir()
-    # Transcription has (2.1)
     (pages_dir / "page_0033.md").write_text(r"$$ y = x \quad (2.1) $$")
 
+    meta = {2: {"chapter_start": {"value": 33}, "chapter_end": {"value": 33}}}
     passed, failures, stats = check_pdf_text_layer_coverage(
         pdf_path=pdf_path,
         pages_dir=pages_dir,
-        in_scope_pages=[33]
+        in_scope_pages=[33],
+        chapters_meta=meta
     )
     assert passed is True  # Warning does not cause failure
     assert len(failures) == 0
@@ -497,19 +749,15 @@ def test_unset_api_key_raises_error(tmp_path: Path, monkeypatch):
     dummy_img = tmp_path / "test.png"
     dummy_img.write_bytes(b"\x89PNG\r\n\x1a\n")
 
-    # transcribe_page_image fails
     with pytest.raises(ValueError, match="GEMINI_API_KEY is not set"):
         imod.transcribe_page_image(dummy_img, api_key=None)
 
-    # run_ingestion fails
     with pytest.raises(ValueError, match="GEMINI_API_KEY is not set"):
         imod.run_ingestion(api_key=None)
 
-    # transcribe_image_with_retry fails
     with pytest.raises(ValueError, match="GEMINI_API_KEY is not set"):
         vmod.transcribe_image_with_retry(dummy_img, api_key=None)
 
-    # check_cross_model_spot with retranscribe=True fails
     pages_dir = tmp_path / "pages"
     pages_dir.mkdir()
     (pages_dir / "page_0036.md").write_text("dummy")
@@ -521,5 +769,3 @@ def test_unset_api_key_raises_error(tmp_path: Path, monkeypatch):
             api_key=None,
             cross_dir=tmp_path / "cross"
         )
-
-
