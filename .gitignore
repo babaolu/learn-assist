@@ -1,5 +1,6 @@
 # Source PDFs and copyright-restricted materials (never commit)
 book/
+data
 data/
 
 # Legacy book2Lecture data — present on some clones, never commit

@@ -130,22 +130,101 @@ def extract_problems(chapter_num: int, chapter_text: str) -> List[Dict[str, Any]
     return sorted(dedup.values(), key=lambda x: x["item_number"])
 
 
-def run_assembly(pages_dir: Path = Path("data/pages")):
-    """Assembles all configured chapters and extracts problems."""
-    chapters_dir = Path("data/chapters")
-    problems_dir = Path("data/problems")
+def apply_errata(
+    chapter_text: str,
+    errata: List[Dict[str, Any]],
+    chapter_num: Optional[int] = None
+) -> str:
+    """
+    Applies approved errata to chapter text.
+    - Entries with status != 'approved' are ignored.
+    - If status == 'approved':
+      - The 'printed' string MUST be found exactly once.
+      - If missing or appears more than once, raises ValueError.
+      - If kind == 'judgement': text is left unchanged, and a note is appended:
+          [Possible erratum {id}: {basis}]
+      - Else: replaces 'printed' with:
+          {corrected} [Erratum {id}: the printed book has {printed}.]
+    """
+    result = chapter_text
+    ch_info = f" in Chapter {chapter_num}" if chapter_num else ""
+    for entry in errata:
+        status = entry.get("status")
+        if status != "approved":
+            continue
+
+        e_id = entry.get("id", "unknown")
+        printed = entry.get("printed", "")
+        corrected = entry.get("corrected")
+        kind = entry.get("kind", "certain")
+        basis = entry.get("basis", "")
+
+        count = result.count(printed)
+        if count == 0:
+            raise ValueError(
+                f"Errata {e_id}{ch_info}: 'printed' string not found: {printed!r}"
+            )
+        elif count > 1:
+            raise ValueError(
+                f"Errata {e_id}{ch_info}: 'printed' string found {count} times (expected exactly 1): {printed!r}"
+            )
+
+        if kind == "judgement":
+            replacement = f"{printed} [Possible erratum {e_id}: {basis}]"
+        else:
+            replacement = f"{corrected} [Erratum {e_id}: the printed book has {printed}.]"
+
+        result = result.replace(printed, replacement, 1)
+
+    return result
+
+
+def run_assembly(
+    pages_dir: Path = Path("data/pages"),
+    chapters_dir: Path = Path("data/chapters"),
+    printed_dir: Path = Path("data/chapters_printed"),
+    problems_dir: Path = Path("data/problems"),
+    errata_path: Optional[Path] = Path("data/errata.json")
+):
+    """
+    Assembles all configured chapters into:
+    - data/chapters_printed/ : assembled exactly from data/pages (as printed)
+    - data/chapters/ : with approved errata applied and visible notes
+    - data/problems/ : structured problem extractions
+    """
     chapters_dir.mkdir(parents=True, exist_ok=True)
+    printed_dir.mkdir(parents=True, exist_ok=True)
     problems_dir.mkdir(parents=True, exist_ok=True)
+
+    all_errata = []
+    if errata_path and errata_path.exists():
+        try:
+            all_errata = json.loads(errata_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"Warning: failed to load {errata_path}: {e}")
 
     for ch_num, cfg in CHAPTER_CONFIG.items():
         print(f"\n--- Assembling Chapter {ch_num:02d}: {cfg['title']} ---")
-        ch_md = assemble_chapter_markdown(cfg["start_page"], cfg["end_page"], pages_dir)
-        out_md_path = Path(cfg["output_md"])
-        out_md_path.write_text(ch_md, encoding="utf-8")
-        print(f"Saved {out_md_path} ({len(ch_md)} characters)")
+        ch_printed = assemble_chapter_markdown(cfg["start_page"], cfg["end_page"], pages_dir)
 
-        problems = extract_problems(ch_num, ch_md)
-        out_prob_path = Path(cfg["output_problems"])
+        # 1. Output to chapters_printed/
+        out_printed_path = printed_dir / f"chapter_{ch_num:02d}.md"
+        out_printed_path.write_text(ch_printed, encoding="utf-8")
+        print(f"Saved printed chapter to {out_printed_path} ({len(ch_printed)} characters)")
+
+        # 2. Apply errata for data/chapters/
+        ch_errata = [
+            e for e in all_errata
+            if cfg["start_page"] <= e.get("pdf_page", 0) <= cfg["end_page"]
+        ]
+        ch_corrected = apply_errata(ch_printed, ch_errata, chapter_num=ch_num)
+        out_md_path = chapters_dir / f"chapter_{ch_num:02d}.md"
+        out_md_path.write_text(ch_corrected, encoding="utf-8")
+        print(f"Saved corrected chapter to {out_md_path} ({len(ch_corrected)} characters)")
+
+        # 3. Extract problems
+        problems = extract_problems(ch_num, ch_corrected)
+        out_prob_path = problems_dir / f"chapter_{ch_num:02d}.json"
         with open(out_prob_path, "w", encoding="utf-8") as f:
             json.dump(problems, f, indent=2, ensure_ascii=False)
         print(f"Extracted {len(problems)} problems into {out_prob_path}")
@@ -156,9 +235,20 @@ def run_assembly(pages_dir: Path = Path("data/pages")):
 def main():
     parser = argparse.ArgumentParser(description="Assemble transcribed pages into chapters and extract problems.")
     parser.add_argument("--pages-dir", type=Path, default=Path("data/pages"), help="Directory with page markdown checkpoints")
+    parser.add_argument("--chapters-dir", type=Path, default=Path("data/chapters"), help="Output directory for corrected chapters")
+    parser.add_argument("--printed-dir", type=Path, default=Path("data/chapters_printed"), help="Output directory for printed chapters")
+    parser.add_argument("--problems-dir", type=Path, default=Path("data/problems"), help="Output directory for problems")
+    parser.add_argument("--errata-path", type=Path, default=Path("data/errata.json"), help="Path to errata.json")
     args = parser.parse_args()
-    run_assembly(pages_dir=args.pages_dir)
+    run_assembly(
+        pages_dir=args.pages_dir,
+        chapters_dir=args.chapters_dir,
+        printed_dir=args.printed_dir,
+        problems_dir=args.problems_dir,
+        errata_path=args.errata_path
+    )
 
 
 if __name__ == "__main__":
     main()
+
