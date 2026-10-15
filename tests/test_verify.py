@@ -315,7 +315,6 @@ def test_cross_model_classifies_agree_disagree_unverified(tmp_path: Path):
     passed, failures, stats = check_cross_model_spot(
         pages_dir=pages_dir,
         sampled_pages=[40, 41, 42],
-        retranscribe=False,
         cross_dir=cross_dir,
         in_scope_pages=[40, 41, 42],
         chapters_meta=meta,
@@ -342,7 +341,6 @@ def test_cross_model_timeout_is_unverified_not_agreement_or_disagreement(tmp_pat
     passed, failures, stats = check_cross_model_spot(
         pages_dir=pages_dir,
         sampled_pages=[50],
-        retranscribe=False,
         cross_dir=cross_dir,
         in_scope_pages=[50],
         chapters_meta=meta
@@ -374,7 +372,10 @@ def test_cross_model_same_vendor_does_not_count_toward_coverage(tmp_path: Path):
 
     # Manifest records vendor as google (same as primary)
     manifest = {
-        "page_0046": {"vendor": "google", "model": "gemma-4-31b-it"}
+        "pages": {
+            "page_0046": {"file": "page_0046_cross.md"}
+        },
+        "cross_model": {"vendor": "google", "model": "gemma-4-31b-it"}
     }
     (cross_dir / "manifest.json").write_text(json.dumps(manifest))
 
@@ -382,7 +383,6 @@ def test_cross_model_same_vendor_does_not_count_toward_coverage(tmp_path: Path):
     passed, failures, stats = check_cross_model_spot(
         pages_dir=pages_dir,
         sampled_pages=[46],
-        retranscribe=False,
         cross_dir=cross_dir,
         in_scope_pages=[46],
         chapters_meta=meta,
@@ -761,14 +761,6 @@ def test_unset_api_key_raises_error(tmp_path: Path, monkeypatch):
     pages_dir = tmp_path / "pages"
     pages_dir.mkdir()
     (pages_dir / "page_0036.md").write_text("dummy")
-    with pytest.raises(ValueError, match="GEMINI_API_KEY is not set"):
-        vmod.check_cross_model_spot(
-            pages_dir=pages_dir,
-            sampled_pages=[36],
-            retranscribe=True,
-            api_key=None,
-            cross_dir=tmp_path / "cross"
-        )
 
 
 def test_cross_model_identical_labels_differing_equation_bodies_gives_disagree(tmp_path: Path):
@@ -788,7 +780,7 @@ def test_cross_model_identical_labels_differing_equation_bodies_gives_disagree(t
 
     manifest = {
         "cross_model": {"vendor": "Anthropic", "model": "claude-opus-5-5"},
-        "pages": {"page_0040": {}}
+        "pages": {"page_0040": {"file": "page_0040_cross.md"}}
     }
     (cross_dir / "manifest.json").write_text(json.dumps(manifest))
 
@@ -796,7 +788,6 @@ def test_cross_model_identical_labels_differing_equation_bodies_gives_disagree(t
     passed, failures, stats = check_cross_model_spot(
         pages_dir=pages_dir,
         sampled_pages=[40],
-        retranscribe=False,
         cross_dir=cross_dir,
         in_scope_pages=[40],
         chapters_meta=meta,
@@ -821,7 +812,6 @@ def test_cross_model_identical_labels_differing_equation_bodies_gives_disagree(t
     passed_adj, _, stats_adj = check_cross_model_spot(
         pages_dir=pages_dir,
         sampled_pages=[40],
-        retranscribe=False,
         cross_dir=cross_dir,
         in_scope_pages=[40],
         chapters_meta=meta,
@@ -830,8 +820,11 @@ def test_cross_model_identical_labels_differing_equation_bodies_gives_disagree(t
     assert passed_adj is True
     assert stats_adj["agreed_count"] == 1
     assert stats_adj["results"][0]["status"] == "AGREE"
-    assert stats_adj["results"][0]["eq_counts"]["notation_only"] == 1
+    assert stats_adj["results"][0]["eq_counts"]["excused"] == 1
+    assert stats_adj["results"][0]["eq_counts"]["notation_only"] == 0
     assert stats_adj["results"][0]["eq_counts"]["differ"] == 0
+    assert stats_adj["total_excused"] == 1
+    assert stats_adj["total_notation_only"] == 0
 
 
 def test_running_head_section_not_counted_as_section():
@@ -877,7 +870,7 @@ def test_cross_model_manifest_vendor_google_gives_fail(tmp_path: Path):
 
     manifest = {
         "cross_model": {"vendor": "Google", "model": "gemini-2.5-flash"},
-        "pages": {"page_0046": {}}
+        "pages": {"page_0046": {"file": "page_0046_cross.md"}}
     }
     (cross_dir / "manifest.json").write_text(json.dumps(manifest))
 
@@ -885,7 +878,6 @@ def test_cross_model_manifest_vendor_google_gives_fail(tmp_path: Path):
     passed, failures, stats = check_cross_model_spot(
         pages_dir=pages_dir,
         sampled_pages=[46],
-        retranscribe=False,
         cross_dir=cross_dir,
         in_scope_pages=[46],
         chapters_meta=meta,
@@ -896,4 +888,57 @@ def test_cross_model_manifest_vendor_google_gives_fail(tmp_path: Path):
     assert any("matches primary vendor" in f for f in failures)
     assert stats["cross_vendor"] == "Google"
     assert stats["achieved_coverage_pct"] == 0.0
+
+
+def test_cross_model_unlisted_cross_file_fails(tmp_path: Path):
+    """
+    Check g: An unlisted page_*_cross.md in cross_dir makes check g FAIL and names the file.
+    """
+    pages_dir = tmp_path / "pages"
+    pages_dir.mkdir()
+    cross_dir = tmp_path / "cross_model"
+    cross_dir.mkdir()
+
+    (pages_dir / "page_0040.md").write_text(r"$$ x = 1 \quad (2.1) $$")
+    (cross_dir / "page_0040_cross.md").write_text(r"$$ x = 1 \quad (2.1) $$")
+    (cross_dir / "page_0999_cross.md").write_text(r"$$ x = 1 \quad (2.1) $$")
+
+    manifest = {
+        "cross_model": {"vendor": "Anthropic", "model": "claude-opus-5-5"},
+        "pages": {"page_0040": {"file": "page_0040_cross.md"}}
+    }
+    (cross_dir / "manifest.json").write_text(json.dumps(manifest))
+
+    meta = {2: {"chapter_start": {"value": 40}, "chapter_end": {"value": 40}}}
+    passed, failures, stats = check_cross_model_spot(
+        pages_dir=pages_dir,
+        sampled_pages=[40],
+        cross_dir=cross_dir,
+        in_scope_pages=[40],
+        chapters_meta=meta,
+        primary_vendor="Google"
+    )
+
+    assert passed is False
+    assert any("page_0999_cross.md" in f for f in failures)
+
+
+def test_verify_exposes_no_option_writing_to_cross_model():
+    """
+    verify.py exposes no option that writes to data/cross_model/.
+    """
+    import inspect
+    import learn_assist.verify as vmod
+
+    sig_spot = inspect.signature(vmod.check_cross_model_spot)
+    assert "retranscribe" not in sig_spot.parameters
+    assert "api_key" not in sig_spot.parameters
+
+    sig_run = inspect.signature(vmod.run_verification)
+    assert "retranscribe" not in sig_run.parameters
+    assert "api_key" not in sig_run.parameters
+
+    src = inspect.getsource(vmod.main)
+    assert "--retranscribe" not in src
+    assert "--api-key" not in src
 

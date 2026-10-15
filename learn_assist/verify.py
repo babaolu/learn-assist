@@ -969,9 +969,7 @@ def check_cross_model_spot(
     pages_dir: Path,
     sample_ratio: float = 0.10,
     seed: int = 42,
-    api_key: Optional[str] = None,
     cross_model: Optional[str] = None,
-    retranscribe: bool = False,
     sampled_pages: Optional[List[int]] = None,
     cross_dir: Path = Path("data/cross_model"),
     pdf_path: Optional[Path] = None,
@@ -985,8 +983,9 @@ def check_cross_model_spot(
       cross model / vendor from 'cross_model' block.
     - Fails if cross model vendor matches primary vendor (Google).
     - Compares equation bodies via crosscheck (labelled_equations, norm) and label sets.
-    - Excuses equation differ if adjudication.json has 'layout_only' or 'ambiguous_print'.
-    - Tracks per-page equation counts (match / notation_only / differ).
+    - Excuses equation differ if adjudication.json has 'layout_only' or 'ambiguous_print' into 'excused'.
+    - Tracks per-page equation counts (match / notation_only / excused / differ).
+    - Read-only check: fails if any unlisted page_*_cross.md exists in cross_dir.
     """
     if chapters_meta is None:
         ref_ch, _, _ = load_chapter_metadata()
@@ -995,8 +994,6 @@ def check_cross_model_spot(
         in_scope_pages = get_in_scope_pages(chapters_meta)
 
     failures = []
-    cross_dir.mkdir(parents=True, exist_ok=True)
-    images_dir = Path("data/page_images")
 
     # Load cross-model manifest
     cross_manifest_path = cross_dir / "manifest.json"
@@ -1006,6 +1003,20 @@ def check_cross_model_spot(
             cross_manifest = json.loads(cross_manifest_path.read_text(encoding="utf-8"))
         except Exception as e:
             failures.append(f"Failed to read {cross_manifest_path}: {e}")
+
+    # Guard: any page_*_cross.md in cross_dir not listed in manifest.json's "pages" makes check g FAIL
+    manifest_pages = cross_manifest.get("pages", {}) if isinstance(cross_manifest, dict) else {}
+    listed_files = set()
+    for pk, pdata in manifest_pages.items():
+        listed_files.add(f"{pk}.md")
+        listed_files.add(f"{pk}_cross.md")
+        if isinstance(pdata, dict) and "file" in pdata:
+            listed_files.add(pdata["file"])
+
+    if cross_dir.exists():
+        for cf in sorted(cross_dir.glob("page_*_cross.md")):
+            if cf.name not in listed_files:
+                failures.append(f"Unlisted cross-transcription file in {cross_dir}: {cf.name}")
 
     # Load adjudication if present
     adjudication_path = cross_dir / "adjudication.json"
@@ -1077,16 +1088,18 @@ def check_cross_model_spot(
                 "unverified_count": len(all_sampled),
                 "total_match": 0,
                 "total_notation_only": 0,
+                "total_excused": 0,
                 "total_differ": 0,
                 "results": [
                     {
                         "page": p,
-                        "group": "sampled",
+                        "selection_reason": "sampled",
                         "status": "UNVERIFIED",
                         "vendor": cross_vendor,
                         "model": effective_model,
-                        "eq_counts": {"match": 0, "notation_only": 0, "differ": 0},
-                        "reason": f"Cross-transcription vendor '{cross_vendor}' matches primary vendor '{primary_vendor}'"
+                        "eq_counts": {"match": 0, "notation_only": 0, "excused": 0, "differ": 0},
+                        "reason": f"Cross-transcription vendor '{cross_vendor}' matches primary vendor '{primary_vendor}'",
+                        "labels_with_verdicts": []
                     }
                     for p in all_sampled
                 ]
@@ -1115,24 +1128,24 @@ def check_cross_model_spot(
     unverified_count = 0
 
     for p in all_sampled:
-        group = "dense" if p in dense_pages else "random"
         page_key = f"page_{p:04d}"
+        selection_reason = manifest_pages.get(page_key, {}).get("selection_reason", "—") if isinstance(manifest_pages, dict) else "—"
         primary_file = pages_dir / f"{page_key}.md"
         cross_file = cross_dir / f"{page_key}_cross.md"
         if not cross_file.exists():
             cross_file = cross_dir / f"{page_key}.md"
-        img_path = images_dir / f"{page_key}.png"
 
         if not primary_file.exists():
             failures.append(f"Page {p}: Primary transcription missing for spot check.")
             spot_results.append({
                 "page": p,
-                "group": group,
+                "selection_reason": selection_reason,
                 "status": "UNVERIFIED",
                 "vendor": cross_vendor or "unknown",
                 "model": effective_model,
-                "eq_counts": {"match": 0, "notation_only": 0, "differ": 0},
-                "reason": "Primary transcription missing"
+                "eq_counts": {"match": 0, "notation_only": 0, "excused": 0, "differ": 0},
+                "reason": "Primary transcription missing",
+                "labels_with_verdicts": []
             })
             unverified_count += 1
             continue
@@ -1145,27 +1158,19 @@ def check_cross_model_spot(
 
         if cross_file.exists() and len(cross_file.read_text(encoding="utf-8").strip()) > 0:
             cross_text = cross_file.read_text(encoding="utf-8")
-        elif retranscribe:
-            key = api_key or DEFAULT_API_KEY
-            if not key:
-                raise ValueError("GEMINI_API_KEY is not set. Please set the GEMINI_API_KEY environment variable or pass --api-key to retranscribe.")
-            cross_text, status, err = transcribe_image_with_retry(img_path, key, model=effective_model)
-            if cross_text:
-                cross_file.write_text(cross_text, encoding="utf-8")
-            else:
-                unverified_reason = err
         else:
-            unverified_reason = "Cross-transcription not cached / timed out in previous run"
+            unverified_reason = "Cross-transcription file missing or empty"
 
         if cross_text is None:
             spot_results.append({
                 "page": p,
-                "group": group,
+                "selection_reason": selection_reason,
                 "status": "UNVERIFIED",
                 "vendor": cross_vendor or "unknown",
                 "model": effective_model,
-                "eq_counts": {"match": 0, "notation_only": 0, "differ": 0},
-                "reason": unverified_reason
+                "eq_counts": {"match": 0, "notation_only": 0, "excused": 0, "differ": 0},
+                "reason": unverified_reason,
+                "labels_with_verdicts": []
             })
             unverified_count += 1
             continue
@@ -1187,8 +1192,9 @@ def check_cross_model_spot(
         ce_dict = labelled_equations(cross_text)
         shared_labels = sorted(set(pe_dict.keys()) & set(ce_dict.keys()))
 
-        eq_counts = {"match": 0, "notation_only": 0, "differ": 0}
+        eq_counts = {"match": 0, "notation_only": 0, "excused": 0, "differ": 0}
         differing_labels = []
+        labels_with_verdicts = []
 
         for lab in shared_labels:
             cs = norm(ce_dict[lab], False)
@@ -1203,10 +1209,12 @@ def check_cross_model_spot(
             else:
                 verdict = verdicts_map.get((page_key, lab)) or verdicts_map.get((str(p), lab))
                 if verdict in ("layout_only", "ambiguous_print"):
-                    eq_counts["notation_only"] += 1
+                    eq_counts["excused"] += 1
+                    labels_with_verdicts.append(f"{lab} ({verdict})")
                 else:
                     eq_counts["differ"] += 1
                     differing_labels.append(lab)
+                    labels_with_verdicts.append(f"{lab} ({verdict})" if verdict else f"{lab} (differ)")
 
         if not eq_diff and not sec_diff and eq_counts["differ"] == 0:
             status = "AGREE"
@@ -1225,7 +1233,7 @@ def check_cross_model_spot(
 
         spot_results.append({
             "page": p,
-            "group": group,
+            "selection_reason": selection_reason,
             "status": status,
             "vendor": cross_vendor or "unknown",
             "model": effective_model,
@@ -1236,7 +1244,8 @@ def check_cross_model_spot(
             "cross_secs": cross_secs,
             "eq_diff": eq_diff,
             "sec_diff": sec_diff,
-            "differing_labels": differing_labels
+            "differing_labels": differing_labels,
+            "labels_with_verdicts": labels_with_verdicts
         })
 
     verified_count = agreed_count + disagreed_count
@@ -1262,9 +1271,12 @@ def check_cross_model_spot(
         "unverified_count": unverified_count,
         "total_match": sum(r.get("eq_counts", {}).get("match", 0) for r in spot_results),
         "total_notation_only": sum(r.get("eq_counts", {}).get("notation_only", 0) for r in spot_results),
+        "total_excused": sum(r.get("eq_counts", {}).get("excused", 0) for r in spot_results),
         "total_differ": sum(r.get("eq_counts", {}).get("differ", 0) for r in spot_results),
         "results": spot_results
     }
+
+    print(f"  Totals: {stats['total_match']} exact, {stats['total_notation_only']} notation-only, {stats['total_excused']} excused, {stats['total_differ']} substantive")
 
     return (len(failures) == 0 and unverified_count == 0 and disagreed_count == 0), failures, stats
 
@@ -1596,16 +1608,18 @@ def generate_verification_report(
             lines.append(f"- **Agreed Pages:** {stats.get('agreed_count', 0)}")
             lines.append(f"- **Disagreed Pages:** {stats.get('disagreed_count', 0)}")
             lines.append(f"- **Unverified Pages:** {stats.get('unverified_count', 0)}")
-            lines.append(f"- **Equation Body Totals:** {stats.get('total_match', 0)} exact matches, {stats.get('total_notation_only', 0)} notation-only variations, {stats.get('total_differ', 0)} substantive differences")
+            lines.append(f"- **Equation Body Totals:** {stats.get('total_match', 0)} exact, {stats.get('total_notation_only', 0)} notation-only, {stats.get('total_excused', 0)} excused, {stats.get('total_differ', 0)} substantive")
             lines.append("")
             lines.append("#### Per-Page Equation Body Comparison Table")
             lines.append("")
-            lines.append("| Page | Group | Status | Match | Notation Only | Differ | Differing Labels |")
-            lines.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+            lines.append("| Page | Selection Reason | Status | Match | Notation only | Excused | Differ | Labels |")
+            lines.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
             for r in stats["results"]:
                 eq_c = r.get("eq_counts", {})
-                diff_labs = ", ".join(r.get("differing_labels", [])) if r.get("differing_labels") else "—"
-                lines.append(f"| page_{r['page']:04d} | {r.get('group', '—')} | {r['status']} | {eq_c.get('match', 0)} | {eq_c.get('notation_only', 0)} | {eq_c.get('differ', 0)} | {diff_labs} |")
+                labels_str = ", ".join(r.get("labels_with_verdicts", [])) if r.get("labels_with_verdicts") else "—"
+                lines.append(f"| page_{r['page']:04d} | {r.get('selection_reason', '—')} | {r['status']} | {eq_c.get('match', 0)} | {eq_c.get('notation_only', 0)} | {eq_c.get('excused', 0)} | {eq_c.get('differ', 0)} | {labels_str} |")
+            lines.append("")
+            lines.append(f"Totals: {stats.get('total_match', 0)} exact, {stats.get('total_notation_only', 0)} notation-only, {stats.get('total_excused', 0)} excused, {stats.get('total_differ', 0)} substantive")
             lines.append("")
         elif stats:
             lines.append(f"```json\n{json.dumps(stats, indent=2)}\n```")
@@ -1624,9 +1638,7 @@ def run_verification(
     pdf_path: Optional[Path] = None,
     ref_path: Optional[Path] = None,
     derived_path: Optional[Path] = None,
-    report_path: Path = Path("data/verification_report.md"),
-    api_key: Optional[str] = None,
-    retranscribe: bool = False
+    report_path: Path = Path("data/verification_report.md")
 ) -> int:
     """Executes all verification checks and exits non-zero on failure."""
     print("=" * 60)
@@ -1696,8 +1708,6 @@ def run_verification(
     print("\n[8/9] Verifying g) Cross-Model Spot Check...")
     cross_res = check_cross_model_spot(
         pages_dir,
-        api_key=api_key,
-        retranscribe=retranscribe,
         pdf_path=pdf_path,
         in_scope_pages=in_scope_pages,
         chapters_meta=ref_chapters
@@ -1739,8 +1749,6 @@ def main():
     parser.add_argument("--ref-path", type=Path, default=None, help="Reference anchors JSON path")
     parser.add_argument("--derived-path", type=Path, default=None, help="Derived anchors JSON path")
     parser.add_argument("--report", type=Path, default=Path("data/verification_report.md"), help="Report output path")
-    parser.add_argument("--api-key", type=str, default=None, help="API key for cross-model spot check")
-    parser.add_argument("--retranscribe", action="store_true", default=False, help="Enable API re-transcription of uncached spot check pages")
     args = parser.parse_args()
 
     exit_code = run_verification(
@@ -1750,9 +1758,7 @@ def main():
         pdf_path=args.pdf_path,
         ref_path=args.ref_path,
         derived_path=args.derived_path,
-        report_path=args.report,
-        api_key=args.api_key,
-        retranscribe=args.retranscribe
+        report_path=args.report
     )
     sys.exit(exit_code)
 

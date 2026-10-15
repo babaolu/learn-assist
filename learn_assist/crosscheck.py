@@ -20,16 +20,42 @@ DISPLAY_RE = re.compile(r"\$\$(.*?)\$\$", re.S)
 
 
 INLINE_RE = re.compile(r"(?<!\$)\$(?!\$)([^$]+?)\$(?!\$)")
+RELATION_PREFIX_RE = re.compile(r"^\s*(?:&=|&?\s*=|\\approx|\\leq?\b|\\geq?\b|<|>|\\equiv)")
+
+
+def prose(md: str) -> str:
+    t = DISPLAY_RE.sub(" ", md)
+    t = re.sub(r"\$[^$]*\$", " M ", t)
+    t = re.sub(r"[#*>_`\[\]■—-]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip().lower()
+    return t
 
 
 def labelled_equations(md: str):
     """Return {label: body} for every labelled equation (display, or inline with a label)."""
     md = re.sub(r"(?m)^>\s?", "", md)
-    out = {}
-    blocks = DISPLAY_RE.findall(md)
+    matches = list(DISPLAY_RE.finditer(md))
+    units = []
+    if matches:
+        curr = matches[0].group(1)
+        for i in range(len(matches) - 1):
+            between = md[matches[i].end() : matches[i + 1].start()]
+            next_body = matches[i + 1].group(1)
+            has_prose = bool(prose(between))
+            starts_rel = bool(RELATION_PREFIX_RE.search(next_body))
+            can_merge = not has_prose and (starts_rel or (between.strip() == "" and not LABEL_RE.search(curr)))
+            if can_merge:
+                curr = curr + r" \\ " + next_body
+            else:
+                units.append(curr)
+                curr = next_body
+        units.append(curr)
+
     rest = DISPLAY_RE.sub(" ", md)
-    blocks += [b for b in INLINE_RE.findall(rest) if LABEL_RE.search(b)]
-    for block in blocks:
+    units += [b for b in INLINE_RE.findall(rest) if LABEL_RE.search(b)]
+
+    out = {}
+    for block in units:
         prev = 0
         for m in LABEL_RE.finditer(block):
             g = m.groups()
@@ -92,14 +118,6 @@ def norm(s: str, loose: bool) -> str:
         s = re.sub(r"[;,.]|\\(?![a-zA-Z])", "", s)
     s = s.rstrip(",.;")
     return s
-
-
-def prose(md: str) -> str:
-    t = DISPLAY_RE.sub(" ", md)
-    t = re.sub(r"\$[^$]*\$", " M ", t)
-    t = re.sub(r"[#*>_`\[\]■—-]", " ", t)
-    t = re.sub(r"\s+", " ", t).strip().lower()
-    return t
 
 
 def main():
