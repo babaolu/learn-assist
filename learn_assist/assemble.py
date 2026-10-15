@@ -130,6 +130,23 @@ def extract_problems(chapter_num: int, chapter_text: str) -> List[Dict[str, Any]
     return sorted(dedup.values(), key=lambda x: x["item_number"])
 
 
+def clean_printed_string(printed: str) -> str:
+    """
+    Cleans a printed string for quotation inside an erratum note:
+    - Removes equation labels matching \\quad\\s*\\(\\d+\\.\\d+[a-z]?\\) or \\tag{...}
+    - Removes $$ and $ delimiters
+    - Strips empty lines that were only delimiters
+    """
+    cleaned = re.sub(r"\\quad\s*\(\d+\.\d+[a-z]?\)", "", printed)
+    cleaned = re.sub(r"\\tag\{[^}]*\}", "", cleaned)
+    lines = []
+    for line in cleaned.splitlines():
+        line = re.sub(r"\$\$|\$", "", line).rstrip()
+        if line.strip():
+            lines.append(line)
+    return "\n".join(lines)
+
+
 def apply_errata(
     chapter_text: str,
     errata: List[Dict[str, Any]],
@@ -141,24 +158,28 @@ def apply_errata(
     - If status == 'approved':
       - The 'printed' string MUST be found exactly once.
       - If missing or appears more than once, raises ValueError.
-      - If kind == 'judgement': text is left unchanged, and a note is appended:
-          [Possible erratum {id}: {basis}]
-      - Else: replaces 'printed' with:
-          {corrected} [Erratum {id}: the printed book has {printed}.]
+      - Applied entries replace 'printed' with 'corrected' in place.
+      - Judgement entries leave text unchanged.
+      - Notes are placed on their own lines immediately AFTER the enclosing unit:
+        - If inside a $$ display block (or spans several), after the closing $$ of the last block.
+        - Otherwise, after the end of the paragraph containing the correction.
+      - Applied note format:
+        > **Erratum {id}** (corrected above). The printed book has:
+        > ```latex
+        > <cleaned printed string>
+        > ```
+      - Judgement note format:
+        > **Possible erratum {id}** (text left as printed): {basis}
     """
     result = chapter_text
     ch_info = f" in Chapter {chapter_num}" if chapter_num else ""
-    for entry in errata:
-        status = entry.get("status")
-        if status != "approved":
-            continue
+    approved = [e for e in errata if e.get("status") == "approved"]
 
-        e_id = entry.get("id", "unknown")
+    # Sort approved errata by position of appearance in the chapter text
+    positions = []
+    for entry in approved:
         printed = entry.get("printed", "")
-        corrected = entry.get("corrected")
-        kind = entry.get("kind", "certain")
-        basis = entry.get("basis", "")
-
+        e_id = entry.get("id", "unknown")
         count = result.count(printed)
         if count == 0:
             raise ValueError(
@@ -168,13 +189,60 @@ def apply_errata(
             raise ValueError(
                 f"Errata {e_id}{ch_info}: 'printed' string found {count} times (expected exactly 1): {printed!r}"
             )
+        idx = result.find(printed)
+        positions.append((idx, entry))
+
+    positions.sort(key=lambda x: x[0])
+
+    for _, entry in positions:
+        e_id = entry.get("id", "unknown")
+        printed = entry.get("printed", "")
+        corrected = entry.get("corrected")
+        kind = entry.get("kind", "certain")
+        basis = entry.get("basis", "")
+
+        idx = result.find(printed)
+        if idx == -1:
+            raise ValueError(
+                f"Errata {e_id}{ch_info}: 'printed' string not found during replacement: {printed!r}"
+            )
+
+        replacement_text = printed if kind == "judgement" else corrected
+        before = result[:idx]
+        inside_math = (before.count("$$") % 2 == 1) or ("$$" in printed)
+
+        result = result[:idx] + replacement_text + result[idx + len(printed):]
+        rep_end = idx + len(replacement_text)
+
+        if inside_math:
+            closing_dd = result.find("$$", rep_end)
+            if closing_dd == -1:
+                raise ValueError(
+                    f"Errata {e_id}{ch_info}: unclosed $$ after display math replacement"
+                )
+            insert_pos = closing_dd + 2
+        else:
+            m = re.search(r"(\n\s*\n|\n(?=\$\$|\#|<!--)|$)", result[rep_end:])
+            insert_pos = rep_end + m.start()
 
         if kind == "judgement":
-            replacement = f"{printed} [Possible erratum {e_id}: {basis}]"
+            note = f"> **Possible erratum {e_id}** (text left as printed): {basis}"
         else:
-            replacement = f"{corrected} [Erratum {e_id}: the printed book has {printed}.]"
+            clean_printed = clean_printed_string(printed)
+            quoted_lines = "\n".join(f"> {line}" for line in clean_printed.splitlines())
+            note = (
+                f"> **Erratum {e_id}** (corrected above). The printed book has:\n"
+                f"> ```latex\n"
+                f"{quoted_lines}\n"
+                f"> ```"
+            )
 
-        result = result.replace(printed, replacement, 1)
+        before_text = result[:insert_pos].rstrip("\n")
+        after_text = result[insert_pos:].lstrip("\n")
+        if after_text:
+            result = f"{before_text}\n\n{note}\n\n{after_text}"
+        else:
+            result = f"{before_text}\n\n{note}\n" if chapter_text.endswith("\n") else f"{before_text}\n\n{note}"
 
     return result
 
