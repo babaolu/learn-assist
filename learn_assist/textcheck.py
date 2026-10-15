@@ -18,6 +18,12 @@ from learn_assist.crosscheck import norm
 
 INLINE_RE = re.compile(r"(?<!\$)\$(?!\$)([^$]+?)\$(?!\$)")
 
+LABEL_RE = re.compile(
+    r"(?:\\tag\{[^}]*\})|"
+    r"(?:\\quad\s*\(\s*\d+\.\d+\s*[a-z]?\s*\))|"
+    r"(?:\(\s*\d+\.\d+\s*(?:\\text\{\s*[a-z]\s*\}|\\mathrm\{\s*[a-z]\s*\}|[a-z])?\s*\))"
+)
+
 HIGH_PRIO_WORDS = {
     "not", "no", "never", "cannot", "none", "neither", "nor",
     "on", "off", "increase", "decrease", "increasing", "decreasing",
@@ -28,34 +34,122 @@ HIGH_PRIO_WORDS = {
 ANTONYM_PREFIXES = ("un", "in", "non")
 
 
+def strip_figure_descriptions(text: str) -> str:
+    """Remove '(Figure description: ...)' spans up to the matching close parenthesis."""
+    pattern = re.compile(r"\(Figure\s+description:", re.IGNORECASE)
+    while True:
+        m = pattern.search(text)
+        if not m:
+            break
+        start = m.start()
+        depth = 0
+        end = len(text)
+        for i in range(start, len(text)):
+            if text[i] == "(":
+                depth += 1
+            elif text[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        text = text[:start] + " " + text[end:]
+    return text
+
+
+def is_display_math_line(line: str) -> bool:
+    """
+    Check if a line's non-whitespace content is only inline math segments ($...$,
+    optionally separated by commas, semicolons, 'and', or labels like 'Commutative law:').
+    """
+    s = line.strip()
+    s = re.sub(r"^>\s*", "", s).strip()
+    s = re.sub(r"^[-*]\s*", "", s).strip()
+    if not s or s.startswith("$$"):
+        return False
+    if not re.search(r"(?<!\$)\$(?!\$)[^$]+?\$(?!\$)", s):
+        return False
+
+    # Check optional leading label ending with colon: e.g. "Commutative law:", "laws:", "Hint:"
+    m_label = re.match(r"^([*_\s\-]*[a-zA-Z\s]+[*_\s\-]*:)\s*", s)
+    if m_label:
+        s = s[m_label.end():].strip()
+
+    if not s:
+        return False
+
+    rest = re.sub(r"(?<!\$)\$(?!\$)[^$]+?\$(?!\$)", " ", s).strip()
+    if not rest:
+        return True
+
+    clean = re.sub(r"[\s,;:.—–\-\"']+", " ", rest).strip()
+    if not clean:
+        return True
+
+    words = clean.split()
+    if all(w.lower() in {"and", "or"} for w in words):
+        return True
+
+    return False
+
+
 def extract_prose(text: str) -> Tuple[List[str], List[str]]:
     """
     Extract prose and inline math tokens from a page markdown.
     Returns: (list_of_word_tokens, list_of_math_strings)
     """
+    # 2c. Remove (Figure description: ...) spans up to matching close parenthesis
+    text = strip_figure_descriptions(text)
+
+    # 2c. Remove any HTML tags with their attributes (<div ...>, </div>, <br>, etc.)
+    text = re.sub(r"<[^>]+>", " ", text)
+
+    # 2a. Treat any line whose content is only inline math (+ separators/labels) as display block
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if is_display_math_line(line):
+            lines[i] = ""
+    text = "\n".join(lines)
+
+    # 2b. Remove any inline $...$ that contains an equation label
+    def strip_labeled_inline(m: re.Match) -> str:
+        content = m.group(1)
+        if LABEL_RE.search(content):
+            return " "
+        return m.group(0)
+
+    text = re.sub(r"(?<!\$)\$(?!\$)([^$]+?)\$(?!\$)", strip_labeled_inline, text)
+
+    # 2d. Remove **bold** and *italic* markers but keep the words
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"__([^_]+)__", r"\1", text)
+    text = re.sub(r"\*([^*]+)\*", r"\1", text)
+    text = re.sub(r"(?<!\w)_([^_]+)_(?!\w)", r"\1", text)
+    text = re.sub(r"\*+", "", text)
+
     # 1. Remove $$...$$ display blocks
     text = re.sub(r"\$\$.*?\$\$", " ", text, flags=re.DOTALL)
 
-    # 2. Remove [Figure: ...] descriptions (including multiline and inline variants)
+    # Remove [Figure: ...] descriptions (including multiline and inline variants)
     text = re.sub(r"(?m)^\s*\[Figure:.*\]\s*$", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\[Figure:[\s\S]*?\](?=\s*(?:\n\n|\Z|\n\s*[*#\w]))", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\[Figure:.*?\]", " ", text, flags=re.IGNORECASE)
 
-    # 3. Running-head lines
+    # Running-head lines
     lines = text.splitlines()
     for i, line in enumerate(lines):
         if line.strip():
             clean = re.sub(r"^[#\s\-—–]+", "", line).strip()
+            # If line has more than 15 words, it is body text, not a running head!
+            if len(clean.split()) > 15:
+                break
             clean_no_cs = re.sub(r"\b(?:Chapter\s+\d+|Section\s+\d+(?:\.\d+)?)\b", "", clean, flags=re.IGNORECASE)
             has_page_num = bool(re.search(r"\b\d+\b", clean_no_cs))
             has_cs = bool(re.search(r"\b(?:Chapter\s+\d+|Section\s+\d+(?:\.\d+)?|Exercises)\b", clean, re.IGNORECASE))
             is_lone_num = bool(re.match(r"^\d+$", clean))
 
             if has_page_num and has_cs:
-                # Combined running head on single line (e.g. "14 — Chapter 2 Mathematical Fundamentals")
                 lines[i] = ""
             elif is_lone_num:
-                # Line 1 is page number, check if line 2 is the title
                 lines[i] = ""
                 for j in range(i + 1, len(lines)):
                     if lines[j].strip():
@@ -64,7 +158,6 @@ def extract_prose(text: str) -> Tuple[List[str], List[str]]:
                             lines[j] = ""
                         break
             elif has_cs:
-                # Line 1 is title, check if line 2 is page number
                 lines[i] = ""
                 for j in range(i + 1, len(lines)):
                     if lines[j].strip():
@@ -84,12 +177,12 @@ def extract_prose(text: str) -> Tuple[List[str], List[str]]:
 
     text = "\n".join(lines)
 
-    # 4. Footnote markers like $^7$, [^7], or unicode superscripts
+    # Footnote markers
     text = re.sub(r"\[\^\d+\]:?", " ", text)
     text = re.sub(r"\$\^\{?\d+\}?\$", " ", text)
     text = re.sub(r"[¹²³⁴⁵⁶⁷⁸⁹⁰]+", " ", text)
 
-    # 5. Extract inline math into placeholder tokens MATH_k
+    # Extract inline math into placeholder tokens MATH_k
     math_list: List[str] = []
 
     def repl_math(m: re.Match) -> str:
@@ -99,9 +192,8 @@ def extract_prose(text: str) -> Tuple[List[str], List[str]]:
 
     text = INLINE_RE.sub(repl_math, text)
 
-    # 6. Markdown markers (#, >, *, **, ■, ---)
+    # Markdown markers
     text = re.sub(r"[#>■]", " ", text)
-    text = re.sub(r"\*+", " ", text)
     text = re.sub(r"-{3,}", " ", text)
 
     # Normalise prose: lowercase, unify quotes and dashes, rejoin words hyphenated across lines, collapse whitespace
@@ -167,10 +259,10 @@ def display_tokens(tokens: List[str], m_list: List[str]) -> str:
     return " ".join(res)
 
 
-def make_snippet(tokens: List[str], m_list: List[str], start: int, end: int) -> str:
-    """Format ~8 words of context either side of diff range [start:end]."""
-    ctx_start = max(0, start - 8)
-    ctx_end = min(len(tokens), end + 8)
+def make_snippet(tokens: List[str], m_list: List[str], start: int, end: int, ctx_words: int = 4) -> str:
+    """Format differing words plus ctx_words of context either side."""
+    ctx_start = max(0, start - ctx_words)
+    ctx_end = min(len(tokens), end + ctx_words)
     parts = []
     if ctx_start < start:
         parts.append(display_tokens(tokens[ctx_start:start], m_list))
@@ -189,11 +281,11 @@ def diff_page(
     cw: List[str],
     cm: List[str]
 ) -> List[Dict[str, Any]]:
-    """Perform word-level diff and math alignment on one page."""
+    """Perform word-level diff and math alignment on one page with autojunk=False."""
     p_keys = [to_key(t) for t in pw]
     c_keys = [to_key(t) for t in cw]
 
-    sm = difflib.SequenceMatcher(None, p_keys, c_keys)
+    sm = difflib.SequenceMatcher(None, p_keys, c_keys, autojunk=False)
     candidates: List[Dict[str, Any]] = []
 
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -206,8 +298,8 @@ def diff_page(
                     p_math = pm[p_idx]
                     c_math = cm[c_idx]
                     if norm(p_math, True) != norm(c_math, True):
-                        p_snip = make_snippet(pw, pm, pi, pi + 1)
-                        c_snip = make_snippet(cw, cm, cj, cj + 1)
+                        p_snip = make_snippet(pw, pm, pi, pi + 1, 4)
+                        c_snip = make_snippet(cw, cm, cj, cj + 1, 4)
                         p_diff = f"${p_math}$"
                         c_diff = f"${c_math}$"
                         candidates.append({
@@ -253,8 +345,8 @@ def diff_page(
 
             p_diff = display_tokens(p_sub, pm)
             c_diff = display_tokens(c_sub, cm)
-            p_snip = make_snippet(pw, pm, i1, i2)
-            c_snip = make_snippet(cw, cm, j1, j2)
+            p_snip = make_snippet(pw, pm, i1, i2, 4)
+            c_snip = make_snippet(cw, cm, j1, j2, 4)
             priority = "high" if is_high_priority(p_diff, c_diff) else "normal"
 
             candidates.append({
@@ -416,6 +508,7 @@ def run_textcheck(repo_root: Optional[Path] = None) -> Tuple[Dict[str, Any], str
     excluded_candidates: List[Dict[str, Any]] = []
 
     page_items = sorted(manifest["pages"].items())
+    valid_crop_files = set()
 
     for page_name, page_info in page_items:
         pf = repo_root / "data/pages" / f"{page_name}.md"
@@ -441,10 +534,18 @@ def run_textcheck(repo_root: Optional[Path] = None) -> Tuple[Dict[str, Any], str
                 crop_rel = locate_and_render_crop(
                     pdf_doc, pdf_page_num, c, crops_dir, crop_fname
                 )
+                if crop_rel:
+                    valid_crop_files.add(crop_fname)
                 c["crop"] = crop_rel
                 c["id"] = f"{page_name}_c{page_cand_idx}"
                 page_cand_idx += 1
                 active_candidates.append(c)
+
+    # Clean up obsolete crop images that no longer exist among candidates
+    if crops_dir.exists():
+        for existing_crop in crops_dir.glob("*.png"):
+            if existing_crop.name not in valid_crop_files:
+                existing_crop.unlink()
 
     # Build summary
     by_kind = {"insert": 0, "delete": 0, "replace": 0, "inline_math": 0}
