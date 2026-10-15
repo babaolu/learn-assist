@@ -52,6 +52,24 @@ def test_pending_erratum_not_applied():
     assert result == text
 
 
+def test_rejected_erratum_not_applied():
+    text = "Equation (3.25) can be expressed as"
+    errata = [
+        {
+            "id": "E12",
+            "pdf_page": 83,
+            "label": None,
+            "printed": "Equation (3.25) can be expressed as",
+            "corrected": "Equation (3.16) can be expressed as",
+            "basis": "Not an erratum. Eq. (3.21) in matrix form is exactly Eq. (3.25), so the forward reference is correct.",
+            "kind": "certain",
+            "status": "rejected"
+        }
+    ]
+    result = apply_errata(text, errata, chapter_num=3)
+    assert result == text
+
+
 def test_judgement_erratum_adds_note_leaves_text_unchanged():
     text = "This frequency shift disappears when the $B_1$ field is turned on."
     errata = [
