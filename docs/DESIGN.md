@@ -52,6 +52,7 @@ The headline result is the Bucket B score.
   independently; disagreements surface to the user rather than being averaged.
 - Raw learner answers are stored verbatim for later re-grading.
 - Test items are never shown during teaching.
+- Blinding protocol: see [docs/BLINDING.md](BLINDING.md) for strict blinding rules ensuring the learner never sees items, solutions, keys, or rubrics prior to testing.
 
 # INGESTION
 The source PDF is a scan. Its OCR text layer is corrupted on mathematics —
