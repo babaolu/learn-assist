@@ -306,6 +306,57 @@ VALID_MODEL_FAMILIES = {"claude", "gemini"}
 VALID_CONFIDENCES = {"high", "medium", "low"}
 VALID_KINDS = {"numeric", "expression", "choice", "text"}
 
+POSITIVE_CONVENTION_SYMBOLS: Set[str] = {
+    "gamma", "gammabar", "hbar", "h", "K", "B0", "B1",
+    "T1", "T2", "M0", "tau_p", "tau", "N_s", "T_s", "omega0"
+}
+
+OTHER_CONVENTION_SYMBOLS: Set[str] = {
+    "Delta_B", "omega_rf", "Delta_omega", "omega_eff", "f0",
+    "alpha", "t", "theta", "phi", "varphi", "I_s", "m_I",
+    "x", "y", "z", "r", "k"
+}
+
+CONVENTION_SYMBOLS: Set[str] = POSITIVE_CONVENTION_SYMBOLS | OTHER_CONVENTION_SYMBOLS
+
+
+def get_convention_local_dict() -> Dict[str, Any]:
+    """
+    Returns local_dict mapping convention names to sympy Symbols
+    (with positive=True for physical quantities), pi to sympy.pi,
+    and standard functions.
+    """
+    import sympy
+    from sympy import Symbol, pi
+    ld: Dict[str, Any] = {}
+    for name in POSITIVE_CONVENTION_SYMBOLS:
+        ld[name] = Symbol(name, positive=True)
+    for name in OTHER_CONVENTION_SYMBOLS:
+        ld[name] = Symbol(name)
+    ld["pi"] = pi
+    ld.update({
+        "exp": sympy.exp,
+        "sin": sympy.sin,
+        "cos": sympy.cos,
+        "tan": sympy.tan,
+        "sqrt": sympy.sqrt,
+        "sinc": sympy.sinc,
+        "log": sympy.log,
+        "ln": sympy.log,
+        "Abs": sympy.Abs,
+        "abs": sympy.Abs
+    })
+    return ld
+
+
+def parse_expr_convention(expr_str: str) -> Any:
+    """
+    Parses a sympy expression string using convention symbols local_dict.
+    """
+    from sympy.parsing.sympy_parser import parse_expr
+    local_dict = get_convention_local_dict()
+    return parse_expr(expr_str, local_dict=local_dict)
+
 
 def validate_key(data: Dict[str, Any], file_path: Optional[Path] = None) -> Tuple[bool, List[str]]:
     """
@@ -357,8 +408,7 @@ def validate_key(data: Dict[str, Any], file_path: Optional[Path] = None) -> Tupl
                         errors.append(f"final_answers[{idx}] kind='expression' requires non-empty 'sympy' string")
                     else:
                         try:
-                            import sympy
-                            sympy.sympify(sympy_str)
+                            parse_expr_convention(sympy_str)
                         except Exception as e:
                             errors.append(f"final_answers[{idx}] sympy parse error: {e}")
 
@@ -542,36 +592,46 @@ def compare_numeric(ans_a: Dict[str, Any], ans_b: Dict[str, Any]) -> bool:
     return (diff / scale) <= rel_tol
 
 
-def compare_expression(sympy_str_a: str, sympy_str_b: str) -> bool:
+def compare_expression_status(sympy_str_a: str, sympy_str_b: str) -> str:
     """
-    Compares two mathematical expressions:
-    - sympy.simplify(a - b) == 0
-    - numeric spot-check at random points as fallback
+    Compares two mathematical expressions according to symbol convention and equality:
+    - If free-symbol sets differ: returns 'symbol_mismatch'
+    - If free-symbol sets match:
+        - sympy.simplify(a - b) == 0 -> 'agreed'
+        - trigsimp fallback -> 'agreed'
+        - numeric spot-check fallback -> 'agreed'
+        - otherwise -> 'disputed'
     """
     import sympy
 
     try:
-        expr_a = sympy.sympify(sympy_str_a)
-        expr_b = sympy.sympify(sympy_str_b)
+        expr_a = parse_expr_convention(sympy_str_a)
+        expr_b = parse_expr_convention(sympy_str_b)
     except Exception:
-        return False
+        return "disputed"
+
+    symbols_a = {s.name for s in expr_a.free_symbols}
+    symbols_b = {s.name for s in expr_b.free_symbols}
+
+    if symbols_a != symbols_b:
+        return "symbol_mismatch"
 
     diff = sympy.simplify(expr_a - expr_b)
     if diff == 0 or diff.is_zero:
-        return True
+        return "agreed"
 
     try:
         if sympy.trigsimp(diff) == 0:
-            return True
+            return "agreed"
     except Exception:
         pass
 
     symbols = list(expr_a.free_symbols | expr_b.free_symbols)
     if not symbols:
         try:
-            return abs(complex((expr_a - expr_b).evalf())) < 1e-5
+            return "agreed" if abs(complex((expr_a - expr_b).evalf())) < 1e-5 else "disputed"
         except Exception:
-            return False
+            return "disputed"
 
     # Deterministic numeric spot-check
     rng = random.Random(42)
@@ -583,11 +643,19 @@ def compare_expression(sympy_str_a: str, sympy_str_b: str) -> bool:
             diff_val = abs(val_a - val_b)
             scale = max(abs(val_a), abs(val_b), 1e-9)
             if (diff_val / scale) > 1e-4:
-                return False
+                return "disputed"
         except Exception:
-            return False
+            return "disputed"
 
-    return True
+    return "agreed"
+
+
+def compare_expression(sympy_str_a: str, sympy_str_b: str) -> bool:
+    """
+    Compares two mathematical expressions.
+    Returns True if expressions agree and have matching free symbols, False otherwise.
+    """
+    return compare_expression_status(sympy_str_a, sympy_str_b) == "agreed"
 
 
 def compare_choice(val_a: str, val_b: str) -> bool:
@@ -629,14 +697,21 @@ def compare_chapter_keys(
         all_parts = sorted(set(answers_c.keys()) | set(answers_g.keys()))
         part_results = []
         item_has_dispute = False
-        item_has_unresolved_text = False
+        item_has_unresolved = False
 
         if set(answers_c.keys()) != set(answers_g.keys()):
             item_has_dispute = True
 
         for p in all_parts:
             if p not in answers_c or p not in answers_g:
-                part_results.append({"part": p, "status": "disputed", "reason": "part_missing_in_one_key"})
+                existing = answers_c.get(p) or answers_g.get(p)
+                part_kind = existing.get("kind", "unknown") if existing else "unknown"
+                part_results.append({
+                    "part": p,
+                    "kind": part_kind,
+                    "status": "disputed",
+                    "reason": "part_missing_in_one_key"
+                })
                 item_has_dispute = True
                 continue
 
@@ -646,7 +721,12 @@ def compare_chapter_keys(
             kind_c = ans_c.get("kind")
             kind_g = ans_g.get("kind")
             if kind_c != kind_g:
-                part_results.append({"part": p, "status": "disputed", "reason": f"kind_mismatch_{kind_c}_vs_{kind_g}"})
+                part_results.append({
+                    "part": p,
+                    "kind": f"{kind_c}_vs_{kind_g}",
+                    "status": "disputed",
+                    "reason": f"kind_mismatch_{kind_c}_vs_{kind_g}"
+                })
                 item_has_dispute = True
                 continue
 
@@ -658,11 +738,12 @@ def compare_chapter_keys(
                 part_results.append({"part": p, "kind": kind_c, "status": st})
 
             elif kind_c == "expression":
-                ok = compare_expression(ans_c.get("sympy", ""), ans_g.get("sympy", ""))
-                st = "agreed" if ok else "disputed"
-                if not ok:
+                expr_st = compare_expression_status(ans_c.get("sympy", ""), ans_g.get("sympy", ""))
+                if expr_st == "disputed":
                     item_has_dispute = True
-                part_results.append({"part": p, "kind": kind_c, "status": st})
+                elif expr_st == "symbol_mismatch":
+                    item_has_unresolved = True
+                part_results.append({"part": p, "kind": kind_c, "status": expr_st})
 
             elif kind_c == "choice":
                 ok = compare_choice(ans_c.get("value", ""), ans_g.get("value", ""))
@@ -673,12 +754,12 @@ def compare_chapter_keys(
 
             elif kind_c == "text":
                 part_results.append({"part": p, "kind": kind_c, "status": "needs_grading"})
-                item_has_unresolved_text = True
+                item_has_unresolved = True
 
         if item_has_dispute:
             item_status = "key_disputed"
             disputed_count += 1
-        elif item_has_unresolved_text:
+        elif item_has_unresolved:
             item_status = "needs_grading"
             needs_grading_count += 1
         else:
@@ -807,6 +888,58 @@ def generate_report(
 
 
 # ---------------------------------------------------------------------------
+# Symbol Audit Logic
+# ---------------------------------------------------------------------------
+
+def audit_chapter_symbols(
+    chapter: Any,
+    data_dir: Path = Path("data")
+) -> Dict[str, Dict[str, int]]:
+    """
+    Audits symbols across expression answers in both key folders.
+    Returns counts of keys from each family using each non-convention symbol name:
+    {
+        "claude": {symbol_name: key_count, ...},
+        "gemini": {symbol_name: key_count, ...}
+    }
+    """
+    ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+    ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}" / "keys"
+
+    result: Dict[str, Dict[str, int]] = {"claude": {}, "gemini": {}}
+
+    for family in ["claude", "gemini"]:
+        fam_dir = ch_dir / family
+        if not fam_dir.exists():
+            continue
+        sym_to_keys: Dict[str, Set[str]] = {}
+        for p in sorted(fam_dir.glob("*.json")):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            key_symbols: Set[str] = set()
+            for ans in data.get("final_answers", []):
+                if ans.get("kind") == "expression":
+                    sp = ans.get("sympy", "")
+                    if sp:
+                        try:
+                            expr = parse_expr_convention(sp)
+                            key_symbols.update({s.name for s in expr.free_symbols})
+                        except Exception:
+                            pass
+            for s in key_symbols:
+                if s not in CONVENTION_SYMBOLS:
+                    if s not in sym_to_keys:
+                        sym_to_keys[s] = set()
+                    sym_to_keys[s].add(p.stem)
+
+        result[family] = {s: len(keys) for s, keys in sorted(sym_to_keys.items())}
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # CLI Entrypoint & Guard
 # ---------------------------------------------------------------------------
 
@@ -832,6 +965,11 @@ def main():
     p_rep = subparsers.add_parser("report", help="Report counts and statuses for chapter item bank")
     p_rep.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
     p_rep.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
+
+    # audit-symbols
+    p_audit = subparsers.add_parser("audit-symbols", help="Audit non-convention symbols in keys")
+    p_audit.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
+    p_audit.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
 
     args = parser.parse_args()
 
@@ -864,6 +1002,12 @@ def main():
     elif args.subcommand == "report":
         rep_text = generate_report(args.chapter, data_dir=args.data_dir)
         print(guard_output(rep_text))
+
+    elif args.subcommand == "audit-symbols":
+        audit_res = audit_chapter_symbols(args.chapter, data_dir=args.data_dir)
+        for fam in ["claude", "gemini"]:
+            counts = audit_res.get(fam, {})
+            print(guard_output(f"{fam} non-convention symbols: {counts}"))
 
 
 if __name__ == "__main__":

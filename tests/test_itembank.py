@@ -21,10 +21,12 @@ from learn_assist.itembank import (
     validate_key_file,
     compare_numeric,
     compare_expression,
+    compare_expression_status,
     compare_choice,
     compare_chapter_keys,
     generate_report,
-    normalize_unit
+    normalize_unit,
+    parse_expr_convention
 )
 
 
@@ -276,6 +278,89 @@ def test_choice_compare():
     assert compare_choice("A", "a") is True
     assert compare_choice(" True ", "true") is True
     assert compare_choice("A", "B") is False
+
+
+def test_expression_convention_parsing_and_equality():
+    """
+    Tests expression parsing and comparison with convention symbols:
+    - 'gamma*B0' parses as a product of two Symbol instances.
+    - '2*pi*f0' equals 'f0*2*pi'.
+    """
+    import sympy
+    from sympy import Mul, Symbol
+
+    # 'gamma*B0' parses as a product of two Symbol instances
+    expr1 = parse_expr_convention("gamma*B0")
+    assert isinstance(expr1, Mul)
+    assert len(expr1.args) == 2
+    assert all(isinstance(a, Symbol) for a in expr1.args)
+    assert {a.name for a in expr1.args} == {"gamma", "B0"}
+
+    # '2*pi*f0' equals 'f0*2*pi'
+    assert compare_expression("2*pi*f0", "f0*2*pi") is True
+
+
+def test_expression_symbol_mismatch_item_needs_grading(tmp_path: Path):
+    """
+    Tests that comparison of 'gyro*B0' vs 'gamma*B0' gives
+    part status 'symbol_mismatch' and item status 'needs_grading' (not disputed).
+    """
+    # Direct expression comparison status check
+    st = compare_expression_status("gyro*B0", "gamma*B0")
+    assert st == "symbol_mismatch"
+
+    # Full item-bank comparison check
+    data_dir = tmp_path / "data"
+    ch_dir = data_dir / "itembank" / "ch01"
+    items_dir = ch_dir / "items"
+    keys_claude = ch_dir / "keys" / "claude"
+    keys_gemini = ch_dir / "keys" / "gemini"
+    items_dir.mkdir(parents=True)
+    keys_claude.mkdir(parents=True)
+    keys_gemini.mkdir(parents=True)
+
+    item_id = "A_1.01"
+    item_obj = {
+        "item_id": item_id,
+        "bucket": "A",
+        "source_label": "1.1",
+        "pdf_page": 1,
+        "statement_md": "Synthetic problem statement",
+        "parts": ["a"],
+        "references": [],
+        "needs_figure": False,
+        "figure_descriptions": [],
+        "errata_ids": [],
+        "status": "unkeyed"
+    }
+    (items_dir / f"{item_id}.json").write_text(json.dumps(item_obj), encoding="utf-8")
+
+    key_c = {
+        "item_id": item_id, "model_family": "claude", "model_id": "c1",
+        "solved_at": "2026-10-18T10:00:00Z", "solution_md": "...",
+        "final_answers": [{"part": "a", "kind": "expression", "value": "gyro*B0", "sympy": "gyro*B0"}],
+        "assumptions": [], "confidence": "high"
+    }
+    key_g = {
+        "item_id": item_id, "model_family": "gemini", "model_id": "g1",
+        "solved_at": "2026-10-18T10:00:00Z", "solution_md": "...",
+        "final_answers": [{"part": "a", "kind": "expression", "value": "gamma*B0", "sympy": "gamma*B0"}],
+        "assumptions": [], "confidence": "high"
+    }
+    (keys_claude / f"{item_id}.json").write_text(json.dumps(key_c), encoding="utf-8")
+    (keys_gemini / f"{item_id}.json").write_text(json.dumps(key_g), encoding="utf-8")
+
+    rep = compare_chapter_keys(1, data_dir=data_dir)
+    res = rep["results"][item_id]
+
+    assert res["status"] == "needs_grading"
+    assert len(res["parts"]) == 1
+    assert res["parts"][0]["status"] == "symbol_mismatch"
+    assert rep["summary"]["needs_grading"] == 1
+    assert rep["summary"]["key_disputed"] == 0
+
+    item_after = json.loads((items_dir / f"{item_id}.json").read_text(encoding="utf-8"))
+    assert item_after["status"] == "needs_grading"
 
 
 # ---------------------------------------------------------------------------
