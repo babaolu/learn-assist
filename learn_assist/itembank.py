@@ -318,6 +318,7 @@ OTHER_CONVENTION_SYMBOLS: Set[str] = {
 }
 
 CONVENTION_SYMBOLS: Set[str] = POSITIVE_CONVENTION_SYMBOLS | OTHER_CONVENTION_SYMBOLS
+ALLOWED_SLOT_SYMBOLS: Set[str] = CONVENTION_SYMBOLS | {"pi"}
 
 
 def get_convention_local_dict() -> Dict[str, Any]:
@@ -527,7 +528,7 @@ def validate_slots(data: Dict[str, Any], file_path: Optional[Path] = None) -> Tu
             if not isinstance(syms, list):
                 errors.append(f"slots[{idx}] kind='expression' requires list 'symbols_allowed'")
             else:
-                non_conv = [s for s in syms if s not in CONVENTION_SYMBOLS]
+                non_conv = [s for s in syms if s not in ALLOWED_SLOT_SYMBOLS]
                 if non_conv:
                     errors.append(f"slots[{idx}] symbols_allowed contains non-convention symbol(s): {non_conv}")
 
@@ -1235,6 +1236,244 @@ def compare_chapter_slots(
 
 
 # ---------------------------------------------------------------------------
+# Review Queue & Resolution Logic
+# ---------------------------------------------------------------------------
+
+def generate_review_queue(
+    chapter: Any,
+    data_dir: Path = Path("data")
+) -> List[Dict[str, str]]:
+    """
+    Writes data/itembank/chXX/review_queue.json listing every (item_id, slot_id)
+    whose slot status is not 'agree': text slots, disagreeing slots, and
+    slots unanswered by either family.
+    """
+    ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+    ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}"
+    cmp_file = ch_dir / "compare_slots.json"
+
+    if not cmp_file.exists():
+        compare_chapter_slots(chapter, data_dir=data_dir)
+
+    cmp_data = json.loads(cmp_file.read_text(encoding="utf-8"))
+    results = cmp_data.get("results", {})
+
+    queue: List[Dict[str, str]] = []
+    for item_id in sorted(results.keys()):
+        slots = results[item_id].get("slots", [])
+        for s in slots:
+            status = s.get("status", "")
+            if status not in ("agree", "agreed"):
+                queue.append({
+                    "item_id": item_id,
+                    "slot_id": s.get("slot_id", "")
+                })
+
+    ch_dir.mkdir(parents=True, exist_ok=True)
+    out_file = ch_dir / "review_queue.json"
+    out_file.write_text(json.dumps(queue, indent=2), encoding="utf-8")
+    return queue
+
+
+def resolve_chapter(
+    chapter: Any,
+    data_dir: Path = Path("data")
+) -> Dict[str, Any]:
+    """
+    Reads reviews/claude.json and reviews/gemini.json, each a list of
+    {"item_id", "slot_id", "verdict": "equivalent"|"other_wrong"|"mine_wrong"|"both_wrong"|"unclear", "reason"}.
+    Per queued slot:
+      - both 'equivalent' -> verified
+      - one says 'mine_wrong' and the other says 'other_wrong', agreeing on the same wrong answer -> resolved_by_concession, adopting the agreed-correct answer
+      - anything else, or a missing review -> disputed
+    An item is usable if every slot is agree, verified or resolved_by_concession.
+    Writes resolution.json.
+    """
+    ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+    ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}"
+    cmp_file = ch_dir / "compare_slots.json"
+
+    if not cmp_file.exists():
+        compare_chapter_slots(chapter, data_dir=data_dir)
+
+    cmp_data = json.loads(cmp_file.read_text(encoding="utf-8"))
+    results = cmp_data.get("results", {})
+
+    reviews_dir = ch_dir / "reviews"
+    rev_c_file = reviews_dir / "claude.json"
+    rev_g_file = reviews_dir / "gemini.json"
+
+    reviews_c: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    if rev_c_file.exists():
+        try:
+            for r in json.loads(rev_c_file.read_text(encoding="utf-8")):
+                if "item_id" in r and "slot_id" in r:
+                    reviews_c[(r["item_id"], r["slot_id"])] = r
+        except Exception:
+            pass
+
+    reviews_g: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    if rev_g_file.exists():
+        try:
+            for r in json.loads(rev_g_file.read_text(encoding="utf-8")):
+                if "item_id" in r and "slot_id" in r:
+                    reviews_g[(r["item_id"], r["slot_id"])] = r
+        except Exception:
+            pass
+
+    # Load slotted keys to adopt answers when resolving by concession
+    slotted_c_dir = ch_dir / "slotted" / "claude"
+    slotted_g_dir = ch_dir / "slotted" / "gemini"
+
+    keys_c: Dict[str, Dict[str, Any]] = {}
+    if slotted_c_dir.exists():
+        for p in slotted_c_dir.glob("*.json"):
+            try:
+                keys_c[p.stem] = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+    keys_g: Dict[str, Dict[str, Any]] = {}
+    if slotted_g_dir.exists():
+        for p in slotted_g_dir.glob("*.json"):
+            try:
+                keys_g[p.stem] = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+    items_res: Dict[str, Any] = {}
+    usable_item_ids: List[str] = []
+    excluded_item_ids: List[str] = []
+
+    outcomes_count = {
+        "agreed": 0,
+        "verified": 0,
+        "resolved_by_concession": 0,
+        "disputed": 0,
+        "total": 0
+    }
+
+    USABLE_SLOT_OUTCOMES = {"agree", "agreed", "verified", "resolved_by_concession"}
+
+    for item_id in sorted(results.keys()):
+        slots = results[item_id].get("slots", [])
+        slot_resolutions = []
+        item_is_usable = True
+
+        for s in slots:
+            slot_id = s.get("slot_id", "")
+            status = s.get("status", "")
+            outcomes_count["total"] += 1
+
+            if status in ("agree", "agreed"):
+                outcome = "agreed"
+                outcomes_count["agreed"] += 1
+                adopted = (
+                    keys_c.get(item_id, {}).get("answers", {}).get(slot_id)
+                    or keys_g.get(item_id, {}).get("answers", {}).get(slot_id)
+                )
+                slot_resolutions.append({
+                    "slot_id": slot_id,
+                    "kind": s.get("kind"),
+                    "outcome": outcome,
+                    "adopted_answer": adopted
+                })
+            else:
+                # Queued slot
+                key = (item_id, slot_id)
+                rev_c = reviews_c.get(key)
+                rev_g = reviews_g.get(key)
+
+                verdict_c = rev_c.get("verdict") if rev_c else None
+                verdict_g = rev_g.get("verdict") if rev_g else None
+
+                if verdict_c == "equivalent" and verdict_g == "equivalent":
+                    outcome = "verified"
+                    outcomes_count["verified"] += 1
+                    adopted = (
+                        keys_c.get(item_id, {}).get("answers", {}).get(slot_id)
+                        or keys_g.get(item_id, {}).get("answers", {}).get(slot_id)
+                    )
+                    slot_resolutions.append({
+                        "slot_id": slot_id,
+                        "kind": s.get("kind"),
+                        "outcome": outcome,
+                        "adopted_answer": adopted,
+                        "reason": "both_equivalent"
+                    })
+                elif verdict_c == "mine_wrong" and verdict_g == "other_wrong":
+                    # Claude concedes; Gemini is agreed-correct
+                    outcome = "resolved_by_concession"
+                    outcomes_count["resolved_by_concession"] += 1
+                    adopted = keys_g.get(item_id, {}).get("answers", {}).get(slot_id)
+                    slot_resolutions.append({
+                        "slot_id": slot_id,
+                        "kind": s.get("kind"),
+                        "outcome": outcome,
+                        "agreed_correct": "gemini",
+                        "adopted_answer": adopted,
+                        "reason": "claude_conceded"
+                    })
+                elif verdict_g == "mine_wrong" and verdict_c == "other_wrong":
+                    # Gemini concedes; Claude is agreed-correct
+                    outcome = "resolved_by_concession"
+                    outcomes_count["resolved_by_concession"] += 1
+                    adopted = keys_c.get(item_id, {}).get("answers", {}).get(slot_id)
+                    slot_resolutions.append({
+                        "slot_id": slot_id,
+                        "kind": s.get("kind"),
+                        "outcome": outcome,
+                        "agreed_correct": "claude",
+                        "adopted_answer": adopted,
+                        "reason": "gemini_conceded"
+                    })
+                else:
+                    outcome = "disputed"
+                    outcomes_count["disputed"] += 1
+                    slot_resolutions.append({
+                        "slot_id": slot_id,
+                        "kind": s.get("kind"),
+                        "outcome": outcome,
+                        "verdict_claude": verdict_c,
+                        "verdict_gemini": verdict_g,
+                        "reason": "unresolved_or_conflicting_reviews"
+                    })
+
+            if outcome not in USABLE_SLOT_OUTCOMES:
+                item_is_usable = False
+
+        item_status = "usable" if item_is_usable else "excluded"
+        if item_is_usable:
+            usable_item_ids.append(item_id)
+        else:
+            excluded_item_ids.append(item_id)
+
+        items_res[item_id] = {
+            "status": item_status,
+            "slots": slot_resolutions
+        }
+
+    resolution_report = {
+        "chapter": ch_num,
+        "summary": {
+            "usable_items": len(usable_item_ids),
+            "excluded_items": len(excluded_item_ids),
+            "total_items": len(results)
+        },
+        "slot_outcomes": outcomes_count,
+        "usable_item_ids": usable_item_ids,
+        "excluded_item_ids": excluded_item_ids,
+        "items": items_res
+    }
+
+    ch_dir.mkdir(parents=True, exist_ok=True)
+    out_file = ch_dir / "resolution.json"
+    out_file.write_text(json.dumps(resolution_report, indent=2), encoding="utf-8")
+
+    return resolution_report
+
+
+# ---------------------------------------------------------------------------
 # Report Command
 # ---------------------------------------------------------------------------
 
@@ -1303,6 +1542,15 @@ def generate_report(
         except Exception:
             slot_rep = None
 
+    # Check for resolution results
+    resolution_file = ch_dir / "resolution.json"
+    res_rep = None
+    if resolution_file.exists():
+        try:
+            res_rep = json.loads(resolution_file.read_text(encoding="utf-8"))
+        except Exception:
+            res_rep = None
+
     lines = [
         f"=== Item Bank Report: Chapter {ch_num:02d} ===",
         f"Total items: {total_items}",
@@ -1335,6 +1583,18 @@ def generate_report(
                 lines.append(f"  {s}: {statuses[s]}")
         else:
             lines.append("  (none)")
+
+    if res_rep and "summary" in res_rep:
+        lines.append("")
+        lines.append("Items by usability:")
+        lines.append(f"  usable: {res_rep['summary'].get('usable_items', 0)}")
+        lines.append(f"  excluded: {res_rep['summary'].get('excluded_items', 0)}")
+        lines.append("")
+        lines.append("Slot outcomes by type:")
+        outcomes = res_rep.get("slot_outcomes", {})
+        for ot in ["agreed", "verified", "resolved_by_concession", "disputed"]:
+            if ot in outcomes:
+                lines.append(f"  {ot}: {outcomes[ot]}")
 
     lines.append("")
     lines.append(f"Items requiring figure: {needs_figure_count}")
@@ -1452,6 +1712,16 @@ def main():
     p_cmpslots.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
     p_cmpslots.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
 
+    # review-queue
+    p_queue = subparsers.add_parser("review-queue", help="Generate review queue for non-agreed slots")
+    p_queue.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
+    p_queue.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
+
+    # resolve
+    p_res = subparsers.add_parser("resolve", help="Resolve queued reviews for a chapter")
+    p_res.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
+    p_res.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
+
     args = parser.parse_args()
 
     if args.subcommand == "extract-a":
@@ -1517,6 +1787,19 @@ def main():
             f"key_verified_partial={s['key_verified_partial']}, "
             f"key_disputed={s['key_disputed']}, "
             f"incomplete={s['incomplete']}"
+        ))
+
+    elif args.subcommand == "review-queue":
+        queue = generate_review_queue(args.chapter, data_dir=args.data_dir)
+        print(guard_output(f"review-queue: {len(queue)} slots queued for Chapter {args.chapter}"))
+
+    elif args.subcommand == "resolve":
+        rep = resolve_chapter(args.chapter, data_dir=args.data_dir)
+        s = rep["summary"]
+        print(guard_output(
+            f"resolve: Chapter {args.chapter} resolved. "
+            f"usable={s['usable_items']}, excluded={s['excluded_items']}. "
+            f"Slot outcomes: {rep['slot_outcomes']}"
         ))
 
 

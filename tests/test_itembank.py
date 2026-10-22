@@ -31,7 +31,9 @@ from learn_assist.itembank import (
     validate_slot_file,
     validate_slotted_key,
     validate_slotted_key_file,
-    compare_chapter_slots
+    compare_chapter_slots,
+    generate_review_queue,
+    resolve_chapter
 )
 
 
@@ -794,3 +796,233 @@ def test_compare_slots_scenarios(tmp_path: Path):
     assert "choice: 2" in rep_text
     assert "text: 1" in rep_text
     assert "expression: 1" in rep_text
+
+
+# ---------------------------------------------------------------------------
+# Review Queue and Resolve Tests
+# ---------------------------------------------------------------------------
+
+def test_slot_validation_allows_pi():
+    """Tests that 'pi' is allowed in symbols_allowed for expression slots."""
+    slot_data = {
+        "item_id": "A_1.01",
+        "slots": [
+            {
+                "slot_id": "s1",
+                "asks": "Expression with pi",
+                "kind": "expression",
+                "symbols_allowed": ["B0", "gamma", "pi"]
+            }
+        ]
+    }
+    ok, errs = validate_slots(slot_data)
+    assert ok is True
+    assert len(errs) == 0
+
+    # Non-convention symbol still fails
+    slot_data_bad = {
+        "item_id": "A_1.01",
+        "slots": [
+            {
+                "slot_id": "s1",
+                "asks": "Expression with unknown",
+                "kind": "expression",
+                "symbols_allowed": ["B0", "unknown_sym"]
+            }
+        ]
+    }
+    ok_bad, errs_bad = validate_slots(slot_data_bad)
+    assert ok_bad is False
+    assert any("contains non-convention symbol" in e for e in errs_bad)
+
+
+def test_review_queue_and_resolve_rules(tmp_path: Path):
+    """
+    Synthetic tests covering:
+    - review-queue generation (queues non-agreed slots: text, disputed, unanswered)
+    - resolve rules:
+        * both 'equivalent' -> verified
+        * claude 'mine_wrong' + gemini 'other_wrong' -> resolved_by_concession (gemini answer adopted)
+        * gemini 'mine_wrong' + claude 'other_wrong' -> resolved_by_concession (claude answer adopted)
+        * both 'other_wrong' -> disputed
+        * both 'mine_wrong' -> disputed
+        * 'both_wrong' -> disputed
+        * 'unclear' -> disputed
+        * missing review -> disputed
+    - Item usability (all slots agreed/verified/resolved_by_concession -> usable; any disputed -> excluded)
+    - resolution.json disk format
+    - report output displaying usability and slot outcomes by type
+    """
+    data_dir = tmp_path / "data"
+    ch_dir = data_dir / "itembank" / "ch01"
+    slots_dir = ch_dir / "slots"
+    items_dir = ch_dir / "items"
+    keys_c_dir = ch_dir / "slotted" / "claude"
+    keys_g_dir = ch_dir / "slotted" / "gemini"
+    reviews_dir = ch_dir / "reviews"
+
+    for d in [slots_dir, items_dir, keys_c_dir, keys_g_dir, reviews_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    # Item 1: Will be fully usable
+    # s1: numeric agree (not queued)
+    # s2: text, both say equivalent -> verified
+    # s3: numeric dispute, claude concedes (mine_wrong) -> resolved_by_concession
+    # s4: numeric dispute, gemini concedes (mine_wrong) -> resolved_by_concession
+    s_item1 = {
+        "item_id": "A_1.01",
+        "slots": [
+            {"slot_id": "s1", "asks": "Field", "kind": "numeric", "unit": "T"},
+            {"slot_id": "s2", "asks": "Text explanation", "kind": "text"},
+            {"slot_id": "s3", "asks": "Frequency", "kind": "numeric", "unit": "Hz"},
+            {"slot_id": "s4", "asks": "Time", "kind": "numeric", "unit": "s"}
+        ]
+    }
+    kc_item1 = {
+        "item_id": "A_1.01", "model_family": "claude", "model_id": "c1", "filled_at": "2026-10-22T00:00:00Z",
+        "answers": {
+            "s1": {"value": "1.0", "unit": "T"},
+            "s2": {"value": "Claude text explanation"},
+            "s3": {"value": "100.0", "unit": "Hz"},  # Claude will concede this was wrong
+            "s4": {"value": "2.0", "unit": "s"}      # Claude is correct
+        },
+        "unanswerable": []
+    }
+    kg_item1 = {
+        "item_id": "A_1.01", "model_family": "gemini", "model_id": "g1", "filled_at": "2026-10-22T00:00:00Z",
+        "answers": {
+            "s1": {"value": "1.0", "unit": "T"},
+            "s2": {"value": "Gemini text explanation"},
+            "s3": {"value": "200.0", "unit": "Hz"},  # Gemini is correct
+            "s4": {"value": "5.0", "unit": "s"}      # Gemini will concede this was wrong
+        },
+        "unanswerable": []
+    }
+
+    # Item 2: Will be excluded due to disputes
+    # s1: both 'other_wrong' -> disputed
+    # s2: both 'mine_wrong' -> disputed
+    # s3: 'both_wrong' -> disputed
+    # s4: 'unclear' -> disputed
+    # s5: missing review in gemini -> disputed
+    s_item2 = {
+        "item_id": "A_1.02",
+        "slots": [
+            {"slot_id": "s1", "asks": "Ask 1", "kind": "numeric", "unit": "T"},
+            {"slot_id": "s2", "asks": "Ask 2", "kind": "numeric", "unit": "T"},
+            {"slot_id": "s3", "asks": "Ask 3", "kind": "numeric", "unit": "T"},
+            {"slot_id": "s4", "asks": "Ask 4", "kind": "numeric", "unit": "T"},
+            {"slot_id": "s5", "asks": "Ask 5", "kind": "numeric", "unit": "T"}
+        ]
+    }
+    kc_item2 = {
+        "item_id": "A_1.02", "model_family": "claude", "model_id": "c1", "filled_at": "2026-10-22T00:00:00Z",
+        "answers": {
+            "s1": {"value": "1.0", "unit": "T"},
+            "s2": {"value": "1.0", "unit": "T"},
+            "s3": {"value": "1.0", "unit": "T"},
+            "s4": {"value": "1.0", "unit": "T"},
+            "s5": {"value": "1.0", "unit": "T"}
+        },
+        "unanswerable": []
+    }
+    kg_item2 = {
+        "item_id": "A_1.02", "model_family": "gemini", "model_id": "g1", "filled_at": "2026-10-22T00:00:00Z",
+        "answers": {
+            "s1": {"value": "2.0", "unit": "T"},
+            "s2": {"value": "2.0", "unit": "T"},
+            "s3": {"value": "2.0", "unit": "T"},
+            "s4": {"value": "2.0", "unit": "T"},
+            "s5": {"value": "2.0", "unit": "T"}
+        },
+        "unanswerable": []
+    }
+
+    # Write items, slots, slotted keys
+    for item_data, kc_data, kg_data in [(s_item1, kc_item1, kg_item1), (s_item2, kc_item2, kg_item2)]:
+        iid = item_data["item_id"]
+        (slots_dir / f"{iid}.json").write_text(json.dumps(item_data), encoding="utf-8")
+        (keys_c_dir / f"{iid}.json").write_text(json.dumps(kc_data), encoding="utf-8")
+        (keys_g_dir / f"{iid}.json").write_text(json.dumps(kg_data), encoding="utf-8")
+        (items_dir / f"{iid}.json").write_text(json.dumps({"item_id": iid, "bucket": "A", "status": "unkeyed"}), encoding="utf-8")
+
+    # Run compare-slots first
+    compare_chapter_slots(1, data_dir=data_dir)
+
+    # 1. Test review-queue
+    queue = generate_review_queue(1, data_dir=data_dir)
+    # A_1.01 has 3 non-agreed slots (s2, s3, s4)
+    # A_1.02 has 5 non-agreed slots (s1, s2, s3, s4, s5)
+    # Total queued: 8 slots
+    assert len(queue) == 8
+    q_file = ch_dir / "review_queue.json"
+    assert q_file.exists()
+    assert {"item_id": "A_1.01", "slot_id": "s2"} in queue
+    assert {"item_id": "A_1.01", "slot_id": "s1"} not in queue  # agreed slot not queued
+
+    # 2. Write reviews covering all rules
+    revs_c = [
+        # A_1.01
+        {"item_id": "A_1.01", "slot_id": "s2", "verdict": "equivalent", "reason": "Both capture the same physics"},
+        {"item_id": "A_1.01", "slot_id": "s3", "verdict": "mine_wrong", "reason": "Claude missed a factor of 2"},
+        {"item_id": "A_1.01", "slot_id": "s4", "verdict": "other_wrong", "reason": "Gemini used wrong time constant"},
+        # A_1.02
+        {"item_id": "A_1.02", "slot_id": "s1", "verdict": "other_wrong", "reason": "I think I am right"},
+        {"item_id": "A_1.02", "slot_id": "s2", "verdict": "mine_wrong", "reason": "I made an error"},
+        {"item_id": "A_1.02", "slot_id": "s3", "verdict": "both_wrong", "reason": "Neither is correct"},
+        {"item_id": "A_1.02", "slot_id": "s4", "verdict": "unclear", "reason": "Ambiguous"},
+        {"item_id": "A_1.02", "slot_id": "s5", "verdict": "equivalent", "reason": "Only claude reviewed"}
+    ]
+    revs_g = [
+        # A_1.01
+        {"item_id": "A_1.01", "slot_id": "s2", "verdict": "equivalent", "reason": "Both describe relaxation correctly"},
+        {"item_id": "A_1.01", "slot_id": "s3", "verdict": "other_wrong", "reason": "Claude missed factor of 2"},
+        {"item_id": "A_1.01", "slot_id": "s4", "verdict": "mine_wrong", "reason": "I used wrong time constant"},
+        # A_1.02
+        {"item_id": "A_1.02", "slot_id": "s1", "verdict": "other_wrong", "reason": "I think I am right"},
+        {"item_id": "A_1.02", "slot_id": "s2", "verdict": "mine_wrong", "reason": "I also made an error"},
+        {"item_id": "A_1.02", "slot_id": "s3", "verdict": "other_wrong", "reason": "Dispute"},
+        {"item_id": "A_1.02", "slot_id": "s4", "verdict": "equivalent", "reason": "Dispute"},
+        # s5 is omitted from gemini reviews (testing missing review)
+    ]
+    (reviews_dir / "claude.json").write_text(json.dumps(revs_c), encoding="utf-8")
+    (reviews_dir / "gemini.json").write_text(json.dumps(revs_g), encoding="utf-8")
+
+    # 3. Run resolve
+    res_rep = resolve_chapter(1, data_dir=data_dir)
+    assert (ch_dir / "resolution.json").exists()
+
+    summary = res_rep["summary"]
+    assert summary["usable_items"] == 1
+    assert summary["excluded_items"] == 1
+    assert res_rep["usable_item_ids"] == ["A_1.01"]
+    assert res_rep["excluded_item_ids"] == ["A_1.02"]
+
+    # Slot outcomes check
+    outcomes = res_rep["slot_outcomes"]
+    assert outcomes["agreed"] == 1
+    assert outcomes["verified"] == 1
+    assert outcomes["resolved_by_concession"] == 2
+    assert outcomes["disputed"] == 5
+    assert outcomes["total"] == 9
+
+    # Check adopted answers for resolved_by_concession
+    item1_slots = {s["slot_id"]: s for s in res_rep["items"]["A_1.01"]["slots"]}
+    assert item1_slots["s3"]["outcome"] == "resolved_by_concession"
+    assert item1_slots["s3"]["agreed_correct"] == "gemini"
+    assert item1_slots["s3"]["adopted_answer"]["value"] == "200.0"
+
+    assert item1_slots["s4"]["outcome"] == "resolved_by_concession"
+    assert item1_slots["s4"]["agreed_correct"] == "claude"
+    assert item1_slots["s4"]["adopted_answer"]["value"] == "2.0"
+
+    # 4. Verify generate_report with resolution results
+    rep_text = generate_report(1, data_dir=data_dir)
+    assert "Items by usability:" in rep_text
+    assert "usable: 1" in rep_text
+    assert "excluded: 1" in rep_text
+    assert "Slot outcomes by type:" in rep_text
+    assert "agreed: 1" in rep_text
+    assert "verified: 1" in rep_text
+    assert "resolved_by_concession: 2" in rep_text
+    assert "disputed: 5" in rep_text
