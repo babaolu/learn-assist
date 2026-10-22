@@ -26,7 +26,12 @@ from learn_assist.itembank import (
     compare_chapter_keys,
     generate_report,
     normalize_unit,
-    parse_expr_convention
+    parse_expr_convention,
+    validate_slots,
+    validate_slot_file,
+    validate_slotted_key,
+    validate_slotted_key_file,
+    compare_chapter_slots
 )
 
 
@@ -480,3 +485,312 @@ def test_compare_chapter_keys_and_blinding(tmp_path: Path):
         assert f"SECRET_SOLUTION_G" not in rep_output
         assert "Explanation A" not in rep_output
         assert "Explanation B" not in rep_output
+
+
+# ---------------------------------------------------------------------------
+# Slot Schema and Slotted Key Tests
+# ---------------------------------------------------------------------------
+
+def test_slot_validation_pass_and_fail(tmp_path: Path):
+    """Tests slot schema validation pass and failure modes."""
+    valid_slots = {
+        "item_id": "A_1.01",
+        "slots": [
+            {
+                "slot_id": "s1",
+                "part": "a",
+                "asks": "Magnitude of field",
+                "kind": "numeric",
+                "unit": "T",
+                "rel_tol": 0.02
+            },
+            {
+                "slot_id": "s2",
+                "part": "b",
+                "asks": "Larmor frequency",
+                "kind": "expression",
+                "symbols_allowed": ["gamma", "B0"]
+            },
+            {
+                "slot_id": "s3",
+                "part": "c",
+                "asks": "Axis",
+                "kind": "choice",
+                "choices": ["x", "y", "z"]
+            },
+            {
+                "slot_id": "s4",
+                "part": "",
+                "asks": "Mechanism description",
+                "kind": "text"
+            }
+        ]
+    }
+    ok, errs = validate_slots(valid_slots)
+    assert ok is True
+    assert len(errs) == 0
+
+    # Also test file validation
+    slot_file = tmp_path / "A_1.01.json"
+    slot_file.write_text(json.dumps(valid_slots), encoding="utf-8")
+    ok_f, errs_f = validate_slot_file(slot_file)
+    assert ok_f is True
+    assert len(errs_f) == 0
+
+    # 1. Duplicate slot_id
+    bad_dup = {
+        "item_id": "A_1.01",
+        "slots": [
+            {"slot_id": "s1", "asks": "Ask 1", "kind": "text"},
+            {"slot_id": "s1", "asks": "Ask 2", "kind": "text"}
+        ]
+    }
+    ok, errs = validate_slots(bad_dup)
+    assert ok is False
+    assert any("Duplicate slot_id" in e for e in errs)
+
+    # 2. Numeric slot missing unit
+    bad_num = {
+        "item_id": "A_1.01",
+        "slots": [
+            {"slot_id": "s1", "asks": "Field", "kind": "numeric"}
+        ]
+    }
+    ok, errs = validate_slots(bad_num)
+    assert ok is False
+    assert any("requires non-empty string 'unit'" in e for e in errs)
+
+    # 3. Choice slot missing choices
+    bad_choice = {
+        "item_id": "A_1.01",
+        "slots": [
+            {"slot_id": "s1", "asks": "Axis", "kind": "choice", "choices": []}
+        ]
+    }
+    ok, errs = validate_slots(bad_choice)
+    assert ok is False
+    assert any("requires non-empty list 'choices'" in e for e in errs)
+
+    # 4. Expression slot with non-convention symbol in symbols_allowed
+    bad_expr = {
+        "item_id": "A_1.01",
+        "slots": [
+            {"slot_id": "s1", "asks": "Frequency", "kind": "expression", "symbols_allowed": ["gamma", "NON_CONV_SYM"]}
+        ]
+    }
+    ok, errs = validate_slots(bad_expr)
+    assert ok is False
+    assert any("contains non-convention symbol" in e for e in errs)
+
+
+def test_slotted_key_validation_cases():
+    """Tests slotted key validation: wrong kind, missing slot, bad unit, and pass modes."""
+    slots_spec = {
+        "item_id": "A_1.01",
+        "slots": [
+            {"slot_id": "s1", "asks": "Field", "kind": "numeric", "unit": "T"},
+            {"slot_id": "s2", "asks": "Frequency", "kind": "expression", "symbols_allowed": ["gamma", "B0"]},
+            {"slot_id": "s3", "asks": "Axis", "kind": "choice", "choices": ["x", "y", "z"]},
+            {"slot_id": "s4", "asks": "Text", "kind": "text"}
+        ]
+    }
+
+    # Pass case
+    valid_key = {
+        "item_id": "A_1.01",
+        "model_family": "claude",
+        "model_id": "c1",
+        "filled_at": "2026-10-22T00:00:00Z",
+        "answers": {
+            "s1": {"value": "1.5", "unit": "T"},
+            "s2": {"sympy": "gamma * B0"},
+            "s3": {"value": "x"},
+            "s4": {"value": "A valid explanation."}
+        },
+        "unanswerable": []
+    }
+    ok, errs = validate_slotted_key(valid_key, slots_spec)
+    assert ok is True
+    assert len(errs) == 0
+
+    # Pass case with unanswerable
+    valid_key_unans = {
+        "item_id": "A_1.01",
+        "model_family": "gemini",
+        "model_id": "g1",
+        "filled_at": "2026-10-22T00:00:00Z",
+        "answers": {
+            "s1": {"value": "15000", "unit": "G"},  # Gauss converts to Tesla
+            "s2": {"sympy": "B0 * gamma"},
+            "s3": {"value": "Y"}
+        },
+        "unanswerable": ["s4"]
+    }
+    ok, errs = validate_slotted_key(valid_key_unans, slots_spec)
+    assert ok is True
+    assert len(errs) == 0
+
+    # 1. Wrong kind - non-numeric value in numeric slot
+    bad_kind_num = dict(valid_key, answers=dict(valid_key["answers"], s1={"value": "not_a_number", "unit": "T"}))
+    ok, errs = validate_slotted_key(bad_kind_num, slots_spec)
+    assert ok is False
+    assert any("could not be evaluated" in e for e in errs)
+
+    # 2. Wrong kind - disallowed symbol in expression slot
+    bad_kind_expr = dict(valid_key, answers=dict(valid_key["answers"], s2={"sympy": "gamma * B0 * omega0"}))
+    ok, errs = validate_slotted_key(bad_kind_expr, slots_spec)
+    assert ok is False
+    assert any("disallowed symbol" in e for e in errs)
+
+    # 3. Wrong kind - choice not in allowed list
+    bad_kind_choice = dict(valid_key, answers=dict(valid_key["answers"], s3={"value": "w"}))
+    ok, errs = validate_slotted_key(bad_kind_choice, slots_spec)
+    assert ok is False
+    assert any("not in allowed choices" in e for e in errs)
+
+    # 4. Missing slot (neither in answers nor in unanswerable)
+    bad_missing = dict(valid_key, answers={k: v for k, v in valid_key["answers"].items() if k != "s4"})
+    ok, errs = validate_slotted_key(bad_missing, slots_spec)
+    assert ok is False
+    assert any("Missing slots from key" in e for e in errs)
+
+    # 5. Bad unit (numeric slot with 'T' given incompatible unit 's')
+    bad_unit = dict(valid_key, answers=dict(valid_key["answers"], s1={"value": "1.0", "unit": "s"}))
+    ok, errs = validate_slotted_key(bad_unit, slots_spec)
+    assert ok is False
+    assert any("does not convert to slot unit" in e for e in errs)
+
+
+def test_compare_slots_scenarios(tmp_path: Path):
+    """
+    Tests compare-slots with:
+    - agree case -> key_verified
+    - disagree case -> key_disputed
+    - text case -> key_verified_partial
+    - unanswered case -> incomplete
+    And verifies report output uses slot results.
+    """
+    data_dir = tmp_path / "data"
+    ch_dir = data_dir / "itembank" / "ch01"
+    slots_dir = ch_dir / "slots"
+    items_dir = ch_dir / "items"
+    keys_c_dir = ch_dir / "slotted" / "claude"
+    keys_g_dir = ch_dir / "slotted" / "gemini"
+
+    for d in [slots_dir, items_dir, keys_c_dir, keys_g_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    # Setup 4 synthetic items
+    # Item 1: Agree case (numeric 1 T vs 10000 G, and choice "x" vs "x") -> key_verified
+    s1 = {
+        "item_id": "A_1.01",
+        "slots": [
+            {"slot_id": "s1", "asks": "Field", "kind": "numeric", "unit": "T"},
+            {"slot_id": "s2", "asks": "Axis", "kind": "choice", "choices": ["x", "y"]}
+        ]
+    }
+    kc1 = {
+        "item_id": "A_1.01", "model_family": "claude", "model_id": "c1", "filled_at": "2026-10-22T00:00:00Z",
+        "answers": {"s1": {"value": "1.0", "unit": "T"}, "s2": {"value": "x"}}, "unanswerable": []
+    }
+    kg1 = {
+        "item_id": "A_1.01", "model_family": "gemini", "model_id": "g1", "filled_at": "2026-10-22T00:00:00Z",
+        "answers": {"s1": {"value": "10000", "unit": "G"}, "s2": {"value": "X"}}, "unanswerable": []
+    }
+
+    # Item 2: Disagree case (numeric 1.0 T vs 2.0 T) -> key_disputed
+    s2 = {
+        "item_id": "A_1.02",
+        "slots": [
+            {"slot_id": "s1", "asks": "Field", "kind": "numeric", "unit": "T"}
+        ]
+    }
+    kc2 = {
+        "item_id": "A_1.02", "model_family": "claude", "model_id": "c1", "filled_at": "2026-10-22T00:00:00Z",
+        "answers": {"s1": {"value": "1.0", "unit": "T"}}, "unanswerable": []
+    }
+    kg2 = {
+        "item_id": "A_1.02", "model_family": "gemini", "model_id": "g1", "filled_at": "2026-10-22T00:00:00Z",
+        "answers": {"s1": {"value": "2.0", "unit": "T"}}, "unanswerable": []
+    }
+
+    # Item 3: Text case (non-text agrees + text slot remains) -> key_verified_partial
+    s3 = {
+        "item_id": "A_1.03",
+        "slots": [
+            {"slot_id": "s1", "asks": "Axis", "kind": "choice", "choices": ["x", "y"]},
+            {"slot_id": "s2", "asks": "Explanation", "kind": "text"}
+        ]
+    }
+    kc3 = {
+        "item_id": "A_1.03", "model_family": "claude", "model_id": "c1", "filled_at": "2026-10-22T00:00:00Z",
+        "answers": {"s1": {"value": "x"}, "s2": {"value": "Explanation from Claude"}}, "unanswerable": []
+    }
+    kg3 = {
+        "item_id": "A_1.03", "model_family": "gemini", "model_id": "g1", "filled_at": "2026-10-22T00:00:00Z",
+        "answers": {"s1": {"value": "x"}, "s2": {"value": "Explanation from Gemini"}}, "unanswerable": []
+    }
+
+    # Item 4: Unanswered case (s1 answered, s2 unanswerable in one key) -> incomplete
+    s4 = {
+        "item_id": "A_1.04",
+        "slots": [
+            {"slot_id": "s1", "asks": "Field", "kind": "numeric", "unit": "T"},
+            {"slot_id": "s2", "asks": "Frequency", "kind": "expression", "symbols_allowed": ["gamma", "B0"]}
+        ]
+    }
+    kc4 = {
+        "item_id": "A_1.04", "model_family": "claude", "model_id": "c1", "filled_at": "2026-10-22T00:00:00Z",
+        "answers": {"s1": {"value": "1.0", "unit": "T"}, "s2": {"sympy": "gamma * B0"}}, "unanswerable": []
+    }
+    kg4 = {
+        "item_id": "A_1.04", "model_family": "gemini", "model_id": "g1", "filled_at": "2026-10-22T00:00:00Z",
+        "answers": {"s1": {"value": "1.0", "unit": "T"}}, "unanswerable": ["s2"]
+    }
+
+    for idx, (s_data, c_data, g_data) in enumerate([(s1, kc1, kg1), (s2, kc2, kg2), (s3, kc3, kg3), (s4, kc4, kg4)], 1):
+        i_id = f"A_1.{idx:02d}"
+        (slots_dir / f"{i_id}.json").write_text(json.dumps(s_data), encoding="utf-8")
+        (keys_c_dir / f"{i_id}.json").write_text(json.dumps(c_data), encoding="utf-8")
+        (keys_g_dir / f"{i_id}.json").write_text(json.dumps(g_data), encoding="utf-8")
+        item_obj = {"item_id": i_id, "bucket": "A", "source_label": f"1.{idx}", "status": "unkeyed"}
+        (items_dir / f"{i_id}.json").write_text(json.dumps(item_obj), encoding="utf-8")
+
+    # Run compare-slots
+    report_dict = compare_chapter_slots(1, data_dir=data_dir)
+    assert report_dict["items_compared"] == 4
+
+    summary = report_dict["summary"]
+    assert summary["key_verified"] == 1
+    assert summary["key_disputed"] == 1
+    assert summary["key_verified_partial"] == 1
+    assert summary["incomplete"] == 1
+
+    res = report_dict["results"]
+    assert res["A_1.01"]["status"] == "key_verified"
+    assert res["A_1.02"]["status"] == "key_disputed"
+    assert res["A_1.03"]["status"] == "key_verified_partial"
+    assert res["A_1.04"]["status"] == "incomplete"
+
+    # Verify compare_slots.json exists on disk
+    cmp_file = ch_dir / "compare_slots.json"
+    assert cmp_file.exists()
+
+    # Verify updated item statuses on disk
+    assert json.loads((items_dir / "A_1.01.json").read_text(encoding="utf-8"))["status"] == "key_verified"
+    assert json.loads((items_dir / "A_1.02.json").read_text(encoding="utf-8"))["status"] == "key_disputed"
+    assert json.loads((items_dir / "A_1.03.json").read_text(encoding="utf-8"))["status"] == "key_verified_partial"
+    assert json.loads((items_dir / "A_1.04.json").read_text(encoding="utf-8"))["status"] == "incomplete"
+
+    # Run report command: must show slot-based statuses and slot counts by kind
+    rep_text = generate_report(1, data_dir=data_dir)
+    assert "Items by status (slot-based):" in rep_text
+    assert "key_verified: 1" in rep_text
+    assert "key_disputed: 1" in rep_text
+    assert "key_verified_partial: 1" in rep_text
+    assert "incomplete: 1" in rep_text
+    assert "Slots by kind:" in rep_text
+    assert "numeric: 3" in rep_text
+    assert "choice: 2" in rep_text
+    assert "text: 1" in rep_text
+    assert "expression: 1" in rep_text

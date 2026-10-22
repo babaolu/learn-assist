@@ -452,6 +452,269 @@ def validate_key_file(file_path: Path) -> Tuple[bool, List[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Slot Schema & Validators
+# ---------------------------------------------------------------------------
+
+VALID_SLOT_KINDS = {"numeric", "expression", "choice", "text"}
+
+
+def validate_slots(data: Dict[str, Any], file_path: Optional[Path] = None) -> Tuple[bool, List[str]]:
+    """
+    Validates slot file data schema:
+    {"item_id": "...", "slots": [{"slot_id": "s1", "part": "a"|"", "asks": "...",
+     "kind": "numeric"|"expression"|"choice"|"text", "unit": "...", "choices": [...],
+     "symbols_allowed": [...], "rel_tol": 0.02}]}
+    """
+    errors: List[str] = []
+
+    if not isinstance(data, dict):
+        return False, ["Slot data must be a JSON object"]
+
+    if "item_id" not in data or not isinstance(data["item_id"], str) or not data["item_id"].strip():
+        errors.append("Missing or invalid required field 'item_id'")
+
+    if "slots" not in data or not isinstance(data["slots"], list):
+        errors.append("Missing or invalid required field 'slots' (must be a list)")
+        return False, errors
+
+    if file_path:
+        expected_stem = data.get("item_id")
+        if expected_stem and file_path.stem != expected_stem:
+            errors.append(f"Filename stem '{file_path.stem}' does not match item_id '{expected_stem}'")
+
+    seen_slot_ids: Set[str] = set()
+
+    for idx, slot in enumerate(data["slots"]):
+        if not isinstance(slot, dict):
+            errors.append(f"slots[{idx}] must be a dict")
+            continue
+
+        slot_id = slot.get("slot_id")
+        if not slot_id or not isinstance(slot_id, str):
+            errors.append(f"slots[{idx}] missing or invalid 'slot_id'")
+        elif slot_id in seen_slot_ids:
+            errors.append(f"Duplicate slot_id '{slot_id}' at index {idx}")
+        else:
+            seen_slot_ids.add(slot_id)
+
+        if "asks" not in slot or not isinstance(slot["asks"], str):
+            errors.append(f"slots[{idx}] missing or invalid 'asks'")
+
+        kind = slot.get("kind")
+        if kind not in VALID_SLOT_KINDS:
+            errors.append(f"slots[{idx}] invalid kind '{kind}'")
+            continue
+
+        if kind == "numeric":
+            unit = slot.get("unit")
+            if not unit or not isinstance(unit, str) or not unit.strip():
+                errors.append(f"slots[{idx}] kind='numeric' requires non-empty string 'unit'")
+            if "rel_tol" in slot:
+                try:
+                    tol = float(slot["rel_tol"])
+                    if tol < 0:
+                        errors.append(f"slots[{idx}] rel_tol must be non-negative")
+                except Exception:
+                    errors.append(f"slots[{idx}] rel_tol must be float")
+
+        elif kind == "choice":
+            choices = slot.get("choices")
+            if not isinstance(choices, list) or len(choices) == 0:
+                errors.append(f"slots[{idx}] kind='choice' requires non-empty list 'choices'")
+
+        elif kind == "expression":
+            syms = slot.get("symbols_allowed")
+            if not isinstance(syms, list):
+                errors.append(f"slots[{idx}] kind='expression' requires list 'symbols_allowed'")
+            else:
+                non_conv = [s for s in syms if s not in CONVENTION_SYMBOLS]
+                if non_conv:
+                    errors.append(f"slots[{idx}] symbols_allowed contains non-convention symbol(s): {non_conv}")
+
+    return len(errors) == 0, errors
+
+
+def validate_slot_file(file_path: Path) -> Tuple[bool, List[str]]:
+    """Loads and validates a slot JSON file."""
+    if not file_path.exists():
+        return False, [f"File not found: {file_path}"]
+    try:
+        data = json.loads(file_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return False, [f"JSON decode error: {e}"]
+    return validate_slots(data, file_path=file_path)
+
+
+def validate_slotted_key(
+    data: Dict[str, Any],
+    slots_data: Dict[str, Any],
+    file_path: Optional[Path] = None
+) -> Tuple[bool, List[str]]:
+    """
+    Validates slotted key data against corresponding item slot data:
+    {"item_id", "model_family", "model_id", "filled_at",
+     "answers": {"s1": {"value": ..., "sympy": "...", "unit": "..."}},
+     "unanswerable": ["s2"]}
+    """
+    errors: List[str] = []
+
+    if not isinstance(data, dict):
+        return False, ["Slotted key data must be a JSON object"]
+
+    required_top = ["item_id", "model_family", "model_id", "filled_at", "answers", "unanswerable"]
+    for k in required_top:
+        if k not in data:
+            errors.append(f"Missing required field: '{k}'")
+
+    if "model_family" in data and data["model_family"] not in VALID_MODEL_FAMILIES:
+        errors.append(f"Invalid model_family '{data['model_family']}'; must be 'claude' or 'gemini'")
+
+    if "answers" in data and not isinstance(data["answers"], dict):
+        errors.append("'answers' must be a dict")
+
+    if "unanswerable" in data and not isinstance(data["unanswerable"], list):
+        errors.append("'unanswerable' must be a list")
+
+    if file_path:
+        expected_stem = data.get("item_id")
+        if expected_stem and file_path.stem != expected_stem:
+            errors.append(f"Filename stem '{file_path.stem}' does not match item_id '{expected_stem}'")
+        expected_family = data.get("model_family")
+        if expected_family and file_path.parent.name != expected_family:
+            errors.append(f"Parent directory '{file_path.parent.name}' does not match model_family '{expected_family}'")
+
+    if errors:
+        return False, errors
+
+    if data.get("item_id") != slots_data.get("item_id"):
+        errors.append(f"Key item_id '{data.get('item_id')}' does not match slots item_id '{slots_data.get('item_id')}'")
+
+    slots_by_id = {s["slot_id"]: s for s in slots_data.get("slots", []) if "slot_id" in s}
+
+    answered_keys = set(data["answers"].keys())
+    unans_keys = set(data["unanswerable"])
+
+    overlap = answered_keys & unans_keys
+    if overlap:
+        errors.append(f"Slots both answered and marked unanswerable: {sorted(overlap)}")
+
+    all_keyed = answered_keys | unans_keys
+    all_expected = set(slots_by_id.keys())
+
+    missing = all_expected - all_keyed
+    if missing:
+        errors.append(f"Missing slots from key: {sorted(missing)}")
+
+    unknown = all_keyed - all_expected
+    if unknown:
+        errors.append(f"Key contains unknown slot IDs: {sorted(unknown)}")
+
+    for slot_id, ans in data["answers"].items():
+        if slot_id not in slots_by_id:
+            continue
+        slot = slots_by_id[slot_id]
+        kind = slot.get("kind")
+
+        if not isinstance(ans, dict):
+            errors.append(f"answers['{slot_id}'] must be a dict")
+            continue
+
+        if kind == "numeric":
+            val = ans.get("value")
+            if val is None:
+                errors.append(f"answers['{slot_id}'] kind='numeric' missing 'value'")
+            else:
+                try:
+                    import sympy
+                    float(sympy.sympify(str(val)).evalf())
+                except Exception as e:
+                    errors.append(f"answers['{slot_id}'] numeric value '{val}' could not be evaluated: {e}")
+
+            ans_unit = ans.get("unit")
+            slot_unit = slot.get("unit", "")
+            if not ans_unit or not isinstance(ans_unit, str):
+                errors.append(f"answers['{slot_id}'] kind='numeric' requires 'unit'")
+            else:
+                mult_ans, base_ans = normalize_unit(ans_unit)
+                mult_slot, base_slot = normalize_unit(slot_unit)
+                if base_ans != base_slot:
+                    errors.append(
+                        f"answers['{slot_id}'] unit '{ans_unit}' does not convert to slot unit '{slot_unit}'"
+                    )
+
+        elif kind == "expression":
+            sympy_str = ans.get("sympy")
+            if not sympy_str or not isinstance(sympy_str, str):
+                errors.append(f"answers['{slot_id}'] kind='expression' requires non-empty 'sympy' string")
+            else:
+                try:
+                    expr = parse_expr_convention(sympy_str)
+                    free_names = {s.name for s in expr.free_symbols}
+                    allowed = set(slot.get("symbols_allowed", []))
+                    disallowed = free_names - allowed
+                    if disallowed:
+                        errors.append(
+                            f"answers['{slot_id}'] expression uses disallowed symbol(s): {sorted(disallowed)}"
+                        )
+                except Exception as e:
+                    errors.append(f"answers['{slot_id}'] sympy parse error: {e}")
+
+        elif kind == "choice":
+            val = ans.get("value")
+            if val is None:
+                errors.append(f"answers['{slot_id}'] kind='choice' missing 'value'")
+            else:
+                val_norm = str(val).strip().lower()
+                allowed_choices = [str(c).strip().lower() for c in slot.get("choices", [])]
+                if val_norm not in allowed_choices:
+                    errors.append(
+                        f"answers['{slot_id}'] choice '{val}' not in allowed choices {slot.get('choices')}"
+                    )
+
+        elif kind == "text":
+            val = ans.get("value")
+            if val is None or not isinstance(val, str) or not val.strip():
+                errors.append(f"answers['{slot_id}'] kind='text' requires non-empty string 'value'")
+
+    return len(errors) == 0, errors
+
+
+def validate_slotted_key_file(
+    key_path: Path,
+    slot_path: Optional[Path] = None,
+    slots_dir: Optional[Path] = None
+) -> Tuple[bool, List[str]]:
+    """Loads and validates a slotted key JSON file against its slot file."""
+    if not key_path.exists():
+        return False, [f"Key file not found: {key_path}"]
+    try:
+        data = json.loads(key_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return False, [f"Key JSON decode error: {e}"]
+
+    if slot_path is None:
+        item_id = data.get("item_id", key_path.stem)
+        if slots_dir:
+            slot_path = slots_dir / f"{item_id}.json"
+        else:
+            candidate = key_path.parent.parent.parent / "slots" / f"{item_id}.json"
+            if candidate.exists():
+                slot_path = candidate
+            else:
+                return False, [f"Slot file not provided and default not found at {candidate}"]
+
+    if not slot_path.exists():
+        return False, [f"Slot file not found: {slot_path}"]
+
+    try:
+        slots_data = json.loads(slot_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return False, [f"Slot JSON decode error: {e}"]
+
+    return validate_slotted_key(data, slots_data, file_path=key_path)
+
+
+# ---------------------------------------------------------------------------
 # Unit Normalization & Comparison Logic
 # ---------------------------------------------------------------------------
 
@@ -550,11 +813,15 @@ def normalize_unit(unit_str: Optional[str]) -> Tuple[float, str]:
     return 1.0, u
 
 
-def compare_numeric(ans_a: Dict[str, Any], ans_b: Dict[str, Any]) -> bool:
+def compare_numeric(
+    ans_a: Dict[str, Any],
+    ans_b: Dict[str, Any],
+    rel_tol: Optional[float] = None
+) -> bool:
     """
     Compares two numeric answers:
     - unit-normalised (handles SI prefixes and T/G/Hz/rad/s)
-    - equal within the larger rel_tol
+    - equal within the larger rel_tol (or passed rel_tol)
     """
     import sympy
 
@@ -581,7 +848,7 @@ def compare_numeric(ans_a: Dict[str, Any], ans_b: Dict[str, Any]) -> bool:
 
     tol_a = float(ans_a.get("rel_tol", 0.02))
     tol_b = float(ans_b.get("rel_tol", 0.02))
-    rel_tol = max(tol_a, tol_b)
+    effective_rel_tol = float(rel_tol) if rel_tol is not None else max(tol_a, tol_b)
 
     # Near zero absolute check
     if abs(norm_a) < 1e-12 and abs(norm_b) < 1e-12:
@@ -589,7 +856,7 @@ def compare_numeric(ans_a: Dict[str, Any], ans_b: Dict[str, Any]) -> bool:
 
     diff = abs(norm_a - norm_b)
     scale = max(abs(norm_a), abs(norm_b))
-    return (diff / scale) <= rel_tol
+    return (diff / scale) <= effective_rel_tol
 
 
 def compare_expression_status(sympy_str_a: str, sympy_str_b: str) -> str:
@@ -799,6 +1066,174 @@ def compare_chapter_keys(
     return compare_report
 
 
+def compare_chapter_slots(
+    chapter: Any,
+    data_dir: Path = Path("data")
+) -> Dict[str, Any]:
+    """
+    Pairs the two families' slotted answers by slot_id and reuses existing
+    numeric / expression / choice comparators.
+    Item status:
+      - key_verified: all non-text slots agree and there are no text slots
+      - key_verified_partial: all non-text slots agree but text slots remain
+      - key_disputed: any non-text slot disagrees
+      - incomplete: any slot is unanswered by either family
+    Writes compare_slots.json and updates item files.
+    """
+    ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+    ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}"
+    slots_dir = ch_dir / "slots"
+    items_dir = ch_dir / "items"
+    keys_claude = ch_dir / "slotted" / "claude"
+    keys_gemini = ch_dir / "slotted" / "gemini"
+
+    slot_files = {p.stem: p for p in slots_dir.glob("*.json")} if slots_dir.exists() else {}
+    claude_files = {p.stem: p for p in keys_claude.glob("*.json")} if keys_claude.exists() else {}
+    gemini_files = {p.stem: p for p in keys_gemini.glob("*.json")} if keys_gemini.exists() else {}
+
+    common_ids = sorted(set(slot_files.keys()) & set(claude_files.keys()) & set(gemini_files.keys()))
+
+    results: Dict[str, Any] = {}
+    verified_count = 0
+    verified_partial_count = 0
+    disputed_count = 0
+    incomplete_count = 0
+
+    slots_kind_counts = {"numeric": 0, "expression": 0, "choice": 0, "text": 0}
+    total_slots = 0
+
+    for item_id in common_ids:
+        slot_obj = json.loads(slot_files[item_id].read_text(encoding="utf-8"))
+        key_c = json.loads(claude_files[item_id].read_text(encoding="utf-8"))
+        key_g = json.loads(gemini_files[item_id].read_text(encoding="utf-8"))
+
+        answers_c = key_c.get("answers", {})
+        answers_g = key_g.get("answers", {})
+        unans_c = set(key_c.get("unanswerable", []))
+        unans_g = set(key_g.get("unanswerable", []))
+
+        slots = slot_obj.get("slots", [])
+        slot_results = []
+
+        item_has_unanswered = False
+        item_has_disputed_non_text = False
+        item_has_text = False
+
+        for s in slots:
+            slot_id = s.get("slot_id", "")
+            kind = s.get("kind", "")
+            if kind in slots_kind_counts:
+                slots_kind_counts[kind] += 1
+            total_slots += 1
+
+            # Check if unanswered by either family
+            if (slot_id in unans_c or slot_id not in answers_c or
+                slot_id in unans_g or slot_id not in answers_g):
+                slot_results.append({
+                    "slot_id": slot_id,
+                    "kind": kind,
+                    "status": "unanswered"
+                })
+                item_has_unanswered = True
+                continue
+
+            ans_c = answers_c[slot_id]
+            ans_g = answers_g[slot_id]
+
+            if kind == "text":
+                slot_results.append({
+                    "slot_id": slot_id,
+                    "kind": kind,
+                    "status": "needs_grading"
+                })
+                item_has_text = True
+
+            elif kind == "numeric":
+                tol = s.get("rel_tol")
+                ok = compare_numeric(ans_c, ans_g, rel_tol=tol)
+                st = "agreed" if ok else "disputed"
+                if not ok:
+                    item_has_disputed_non_text = True
+                slot_results.append({
+                    "slot_id": slot_id,
+                    "kind": kind,
+                    "status": st
+                })
+
+            elif kind == "expression":
+                ok = compare_expression(ans_c.get("sympy", ""), ans_g.get("sympy", ""))
+                st = "agreed" if ok else "disputed"
+                if not ok:
+                    item_has_disputed_non_text = True
+                slot_results.append({
+                    "slot_id": slot_id,
+                    "kind": kind,
+                    "status": st
+                })
+
+            elif kind == "choice":
+                ok = compare_choice(ans_c.get("value", ""), ans_g.get("value", ""))
+                st = "agreed" if ok else "disputed"
+                if not ok:
+                    item_has_disputed_non_text = True
+                slot_results.append({
+                    "slot_id": slot_id,
+                    "kind": kind,
+                    "status": st
+                })
+
+        # Determine item status
+        if item_has_unanswered:
+            item_status = "incomplete"
+            incomplete_count += 1
+        elif item_has_disputed_non_text:
+            item_status = "key_disputed"
+            disputed_count += 1
+        elif item_has_text:
+            item_status = "key_verified_partial"
+            verified_partial_count += 1
+        else:
+            item_status = "key_verified"
+            verified_count += 1
+
+        results[item_id] = {
+            "status": item_status,
+            "slots": slot_results
+        }
+
+        # Update item status on disk if item file exists
+        item_file = items_dir / f"{item_id}.json"
+        if item_file.exists():
+            try:
+                item_data = json.loads(item_file.read_text(encoding="utf-8"))
+                item_data["status"] = item_status
+                item_file.write_text(json.dumps(item_data, indent=2, ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                pass
+
+    compare_report = {
+        "chapter": ch_num,
+        "items_compared": len(common_ids),
+        "summary": {
+            "key_verified": verified_count,
+            "key_verified_partial": verified_partial_count,
+            "key_disputed": disputed_count,
+            "incomplete": incomplete_count
+        },
+        "slots_summary": {
+            **slots_kind_counts,
+            "total": total_slots
+        },
+        "results": results
+    }
+
+    ch_dir.mkdir(parents=True, exist_ok=True)
+    out_file = ch_dir / "compare_slots.json"
+    out_file.write_text(json.dumps(compare_report, indent=2), encoding="utf-8")
+
+    return compare_report
+
+
 # ---------------------------------------------------------------------------
 # Report Command
 # ---------------------------------------------------------------------------
@@ -813,6 +1248,7 @@ def generate_report(
     - How many need a figure
     - How many keys exist per family
     - Parse warnings by item ID
+    If compare_slots.json exists, displays slot-based statuses and slot counts by kind.
     Strictly NO problem statements or keys.
     """
     ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
@@ -845,10 +1281,27 @@ def generate_report(
     keys_gemini_count = 0
     keys_claude = ch_dir / "keys" / "claude"
     keys_gemini = ch_dir / "keys" / "gemini"
-    if keys_claude.exists():
+    slotted_claude = ch_dir / "slotted" / "claude"
+    slotted_gemini = ch_dir / "slotted" / "gemini"
+
+    if slotted_claude.exists() and list(slotted_claude.glob("*.json")):
+        keys_claude_count = len(list(slotted_claude.glob("*.json")))
+    elif keys_claude.exists():
         keys_claude_count = len(list(keys_claude.glob("*.json")))
-    if keys_gemini.exists():
+
+    if slotted_gemini.exists() and list(slotted_gemini.glob("*.json")):
+        keys_gemini_count = len(list(slotted_gemini.glob("*.json")))
+    elif keys_gemini.exists():
         keys_gemini_count = len(list(keys_gemini.glob("*.json")))
+
+    # Check for slot comparison results
+    compare_slots_file = ch_dir / "compare_slots.json"
+    slot_rep = None
+    if compare_slots_file.exists():
+        try:
+            slot_rep = json.loads(compare_slots_file.read_text(encoding="utf-8"))
+        except Exception:
+            slot_rep = None
 
     lines = [
         f"=== Item Bank Report: Chapter {ch_num:02d} ===",
@@ -863,12 +1316,25 @@ def generate_report(
         lines.append("  (none)")
 
     lines.append("")
-    lines.append("Items by status:")
-    if statuses:
-        for s in sorted(statuses.keys()):
-            lines.append(f"  {s}: {statuses[s]}")
+    if slot_rep and "summary" in slot_rep:
+        lines.append("Items by status (slot-based):")
+        slot_statuses = slot_rep["summary"]
+        for s in sorted(slot_statuses.keys()):
+            lines.append(f"  {s}: {slot_statuses[s]}")
+
+        lines.append("")
+        lines.append("Slots by kind:")
+        slot_kinds = slot_rep.get("slots_summary", {})
+        for k in ["choice", "expression", "numeric", "text", "total"]:
+            if k in slot_kinds:
+                lines.append(f"  {k}: {slot_kinds[k]}")
     else:
-        lines.append("  (none)")
+        lines.append("Items by status:")
+        if statuses:
+            for s in sorted(statuses.keys()):
+                lines.append(f"  {s}: {statuses[s]}")
+        else:
+            lines.append("  (none)")
 
     lines.append("")
     lines.append(f"Items requiring figure: {needs_figure_count}")
@@ -971,6 +1437,21 @@ def main():
     p_audit.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
     p_audit.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
 
+    # validate-slot
+    p_valslot = subparsers.add_parser("validate-slot", help="Validate a slot JSON file against schema")
+    p_valslot.add_argument("slot_file", type=Path, help="Path to slot JSON file")
+
+    # validate-slotted-key
+    p_valslotted = subparsers.add_parser("validate-slotted-key", help="Validate a slotted key JSON file")
+    p_valslotted.add_argument("key_file", type=Path, help="Path to slotted key JSON file")
+    p_valslotted.add_argument("--slot-file", type=Path, default=None, help="Path to corresponding slot JSON file")
+    p_valslotted.add_argument("--slots-dir", type=Path, default=None, help="Directory containing slot JSON files")
+
+    # compare-slots
+    p_cmpslots = subparsers.add_parser("compare-slots", help="Compare claude vs gemini slotted keys for a chapter")
+    p_cmpslots.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
+    p_cmpslots.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
+
     args = parser.parse_args()
 
     if args.subcommand == "extract-a":
@@ -1008,6 +1489,35 @@ def main():
         for fam in ["claude", "gemini"]:
             counts = audit_res.get(fam, {})
             print(guard_output(f"{fam} non-convention symbols: {counts}"))
+
+    elif args.subcommand == "validate-slot":
+        valid, errors = validate_slot_file(args.slot_file)
+        if valid:
+            print(guard_output(f"VALID: {args.slot_file.name}"))
+            sys.exit(0)
+        else:
+            print(guard_output(f"INVALID: {args.slot_file.name} - Errors: {errors}"))
+            sys.exit(1)
+
+    elif args.subcommand == "validate-slotted-key":
+        valid, errors = validate_slotted_key_file(args.key_file, slot_path=args.slot_file, slots_dir=args.slots_dir)
+        if valid:
+            print(guard_output(f"VALID: {args.key_file.name}"))
+            sys.exit(0)
+        else:
+            print(guard_output(f"INVALID: {args.key_file.name} - Errors: {errors}"))
+            sys.exit(1)
+
+    elif args.subcommand == "compare-slots":
+        report = compare_chapter_slots(args.chapter, data_dir=args.data_dir)
+        s = report["summary"]
+        print(guard_output(
+            f"compare-slots: {report['items_compared']} items compared. "
+            f"key_verified={s['key_verified']}, "
+            f"key_verified_partial={s['key_verified_partial']}, "
+            f"key_disputed={s['key_disputed']}, "
+            f"incomplete={s['incomplete']}"
+        ))
 
 
 if __name__ == "__main__":
