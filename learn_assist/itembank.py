@@ -417,10 +417,15 @@ def validate_item(
         except Exception:
             pass
     if ch_num is None:
-        cand_str = item_id or data.get("anchor_item", "")
-        m = re.search(r'[A-Za-z]_(\d+)\.', str(cand_str))
-        if m:
-            ch_num = int(m.group(1))
+        for cand in [data.get("anchor_item", ""), item_id, str(file_path) if file_path else ""]:
+            m = re.search(r'[A-Za-z]_(\d+)\.', str(cand))
+            if m:
+                ch_num = int(m.group(1))
+                break
+            m_ch = re.search(r'ch(\d+)', str(cand))
+            if m_ch:
+                ch_num = int(m_ch.group(1))
+                break
 
     # Resolve valid concepts
     valid_concept_set: Optional[Set[str]] = None
