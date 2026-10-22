@@ -1901,6 +1901,100 @@ def resolve_chapter(
 
 
 # ---------------------------------------------------------------------------
+# Concept Tags Merging
+# ---------------------------------------------------------------------------
+
+def merge_tags_chapter(
+    chapter: Any,
+    data_dir: Path = Path("data")
+) -> Dict[str, Any]:
+    """
+    For each usable A item, takes the intersection of tags/claude.json and tags/gemini.json;
+    if that is empty, takes their union.
+    Writes the result into each A item's "concepts" field.
+    """
+    ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+    ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}"
+    items_dir = ch_dir / "items"
+    tags_dir = ch_dir / "tags"
+
+    claude_tags: Dict[str, List[str]] = {}
+    gemini_tags: Dict[str, List[str]] = {}
+
+    c_file = tags_dir / "claude.json"
+    if c_file.exists():
+        try:
+            claude_tags = json.loads(c_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    g_file = tags_dir / "gemini.json"
+    if g_file.exists():
+        try:
+            gemini_tags = json.loads(g_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    # Usable A items from resolution.json or items
+    res_file = ch_dir / "resolution.json"
+    usable_a_ids: Set[str] = set()
+    if res_file.exists():
+        try:
+            res_json = json.loads(res_file.read_text(encoding="utf-8"))
+            usable_a_ids = {
+                iid for iid in res_json.get("usable_item_ids", [])
+                if not iid.startswith("B_")
+            }
+        except Exception:
+            pass
+
+    items_by_id: Dict[str, Dict[str, Any]] = {}
+    item_files: Dict[str, Path] = {}
+    if items_dir.exists():
+        for p in sorted(items_dir.glob("*.json")):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                iid = data.get("item_id", p.stem)
+                items_by_id[iid] = data
+                item_files[iid] = p
+            except Exception:
+                continue
+
+    if not usable_a_ids:
+        usable_a_ids = {
+            iid for iid, it in items_by_id.items()
+            if (it.get("bucket") == "A" or iid.startswith("A_")) and it.get("status") not in {"excluded", "disputed"}
+        }
+
+    updated_items: List[str] = []
+    merged_tags_map: Dict[str, List[str]] = {}
+
+    for iid in sorted(usable_a_ids):
+        c_set = set(claude_tags.get(iid, []))
+        g_set = set(gemini_tags.get(iid, []))
+
+        inter = c_set & g_set
+        if inter:
+            merged = sorted(list(inter))
+        else:
+            merged = sorted(list(c_set | g_set))
+
+        merged_tags_map[iid] = merged
+        if iid in item_files:
+            it_data = items_by_id[iid]
+            it_data["concepts"] = merged
+            item_files[iid].write_text(json.dumps(it_data, indent=2) + "\n", encoding="utf-8")
+            updated_items.append(iid)
+
+    return {
+        "chapter": ch_num,
+        "usable_a_count": len(usable_a_ids),
+        "updated_items": updated_items,
+        "merged_tags": merged_tags_map
+    }
+
+
+# ---------------------------------------------------------------------------
 # Bucket B Difficulty Screening
 # ---------------------------------------------------------------------------
 
@@ -1957,7 +2051,18 @@ def difficulty_screen_chapter(
             eval_family = "gemini" if "claude" in item_id else "claude"
 
         b_key_file = ch_dir / "keys" / eval_family / f"{item_id}.json"
-        a_key_file = ch_dir / "keys" / eval_family / f"{anchor_id}.json"
+        screen_anchor_file = ch_dir / "screen" / eval_family / f"{anchor_id}.json"
+        keys_anchor_file = ch_dir / "keys" / eval_family / f"{anchor_id}.json"
+
+        if screen_anchor_file.exists():
+            a_key_file = screen_anchor_file
+            anchor_source = "screen"
+        elif keys_anchor_file.exists():
+            a_key_file = keys_anchor_file
+            anchor_source = "keys"
+        else:
+            a_key_file = keys_anchor_file
+            anchor_source = "none"
 
         # If no non-author key exists -> unscreened, never pass
         if not b_key_file.exists():
@@ -1966,6 +2071,7 @@ def difficulty_screen_chapter(
                 "anchor_item": anchor_id,
                 "author_family": author_family,
                 "evaluating_family": eval_family,
+                "anchor_source": anchor_source,
                 "status": "unscreened",
                 "flagged": False,
                 "reasons": ["no_non_author_key"]
@@ -1986,6 +2092,7 @@ def difficulty_screen_chapter(
                 "anchor_item": anchor_id,
                 "author_family": author_family,
                 "evaluating_family": eval_family,
+                "anchor_source": anchor_source,
                 "status": "flagged",
                 "flagged": True,
                 "reasons": ["missing_anchor_key"],
@@ -2014,6 +2121,7 @@ def difficulty_screen_chapter(
                 "anchor_item": anchor_id,
                 "author_family": author_family,
                 "evaluating_family": eval_family,
+                "anchor_source": anchor_source,
                 "status": "flagged",
                 "flagged": True,
                 "reasons": reasons,
@@ -2028,6 +2136,7 @@ def difficulty_screen_chapter(
                 "anchor_item": anchor_id,
                 "author_family": author_family,
                 "evaluating_family": eval_family,
+                "anchor_source": anchor_source,
                 "status": "passed",
                 "flagged": False,
                 "reasons": [],
@@ -2192,10 +2301,101 @@ def select_b_chapter(
     out_file = ch_dir / "selection_b.json"
     out_file.write_text(json.dumps(result, indent=2), encoding="utf-8")
 
+    # Update each B item's status field after resolve, screen and select
+    update_b_item_statuses(ch_num, data_dir=data_dir)
+
     if exit_on_failure and not success:
         sys.exit(1)
 
     return result
+
+
+def update_b_item_statuses(
+    chapter: Any,
+    data_dir: Path = Path("data")
+) -> Dict[str, str]:
+    """
+    Updates each B item's status field after resolve, screen and select.
+    Status is one of:
+      - selected
+      - usable_unselected
+      - flagged_difficulty
+      - excluded_solver_flag
+      - disputed
+    """
+    ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+    ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}"
+    items_dir = ch_dir / "items"
+
+    # 1. Load selection_b.json
+    selected_ids = set()
+    selection_file = ch_dir / "selection_b.json"
+    if selection_file.exists():
+        try:
+            sel_data = json.loads(selection_file.read_text(encoding="utf-8"))
+            selected_ids = set(sel_data.get("selected_items", []))
+        except Exception:
+            pass
+
+    # 2. Load resolution.json
+    res_file = ch_dir / "resolution.json"
+    res_items = {}
+    res_usable_all = None
+    if res_file.exists():
+        try:
+            res_data = json.loads(res_file.read_text(encoding="utf-8"))
+            res_usable_all = set(res_data.get("usable_item_ids", []))
+            res_items = res_data.get("items", {})
+        except Exception:
+            pass
+
+    # 3. Load difficulty.json
+    diff_file = ch_dir / "difficulty.json"
+    flagged_diff_ids = set()
+    if diff_file.exists():
+        try:
+            diff_data = json.loads(diff_file.read_text(encoding="utf-8"))
+            flagged_diff_ids = set(diff_data.get("flagged_item_ids", []))
+            for item in diff_data.get("items", []):
+                if item.get("status") in {"flagged", "unscreened"} or item.get("flagged"):
+                    flagged_diff_ids.add(item.get("item_id"))
+        except Exception:
+            pass
+
+    item_statuses: Dict[str, str] = {}
+    if not items_dir.exists():
+        return item_statuses
+
+    for item_file in sorted(items_dir.glob("*.json")):
+        try:
+            data = json.loads(item_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        item_id = data.get("item_id", item_file.stem)
+        if not (data.get("bucket") == "B" or item_id.startswith("B_")):
+            continue
+
+        # Check solver flag
+        is_sf, _ = check_item_solver_flags(item_id, ch_num, data_dir=data_dir)
+        res_info = res_items.get(item_id, {})
+        res_st = res_info.get("status", "")
+
+        if item_id in selected_ids:
+            new_status = "selected"
+        elif is_sf or res_st == "excluded_solver_flag":
+            new_status = "excluded_solver_flag"
+        elif res_st in {"excluded", "disputed"} or (res_usable_all is not None and item_id not in res_usable_all):
+            new_status = "disputed"
+        elif item_id in flagged_diff_ids:
+            new_status = "flagged_difficulty"
+        else:
+            new_status = "usable_unselected"
+
+        data["status"] = new_status
+        item_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        item_statuses[item_id] = new_status
+
+    return item_statuses
 
 
 def check_coverage_chapter(
@@ -2205,7 +2405,8 @@ def check_coverage_chapter(
 ) -> Dict[str, Any]:
     """
     Per concept, counts usable A items and selected B items.
-    Exits non-zero if any concept has 0 selected B while a usable B candidate exists.
+    Exits non-zero if any concept has 0 selected B while a usable B candidate exists,
+    or if any concept has 0 usable A items while some A item could cover it.
     """
     ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
     ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}"
@@ -2277,6 +2478,23 @@ def check_coverage_chapter(
 
     concept_stats = []
     uncovered_with_candidate: List[str] = []
+    uncovered_a_with_candidate: List[str] = []
+
+    # Check which concepts could be covered by some A item
+    tags_a_concepts: Set[str] = set()
+    for tag_fname in ["claude.json", "gemini.json"]:
+        tag_file = ch_dir / "tags" / tag_fname
+        if tag_file.exists():
+            try:
+                tag_data = json.loads(tag_file.read_text(encoding="utf-8"))
+                for iid, tlist in tag_data.items():
+                    if not iid.startswith("B_"):
+                        tags_a_concepts.update(tlist)
+            except Exception:
+                pass
+    for iid, it in items_by_id.items():
+        if it.get("bucket") == "A" or iid.startswith("A_"):
+            tags_a_concepts.update(it.get("concepts", []))
 
     for c in concepts_data:
         cid = c["concept_id"]
@@ -2289,6 +2507,9 @@ def check_coverage_chapter(
         if selected_b_count == 0 and usable_b_cand_count > 0:
             uncovered_with_candidate.append(cid)
 
+        if usable_a_count == 0 and (cid in tags_a_concepts):
+            uncovered_a_with_candidate.append(cid)
+
         concept_stats.append({
             "concept_id": cid,
             "title": title,
@@ -2297,12 +2518,13 @@ def check_coverage_chapter(
             "usable_b_candidate_count": usable_b_cand_count
         })
 
-    success = (len(uncovered_with_candidate) == 0)
+    success = (len(uncovered_with_candidate) == 0 and len(uncovered_a_with_candidate) == 0)
 
     report = {
         "chapter": ch_num,
         "concepts": concept_stats,
         "uncovered_with_candidate": uncovered_with_candidate,
+        "uncovered_a_with_candidate": uncovered_a_with_candidate,
         "success": success
     }
 
@@ -2505,7 +2727,10 @@ def generate_report(
                     pass
             usable_a_set: Set[str] = set()
             if res_rep:
-                usable_a_set = set(res_rep.get("usable_item_ids", []))
+                usable_a_set = {
+                    iid for iid in res_rep.get("usable_item_ids", [])
+                    if not iid.startswith("B_")
+                }
             elif all_items_list:
                 usable_a_set = {it.get("item_id") for it in all_items_list if it.get("bucket") == "A" and it.get("status") not in {"excluded", "disputed"}}
 
@@ -2668,6 +2893,11 @@ def main():
     p_selb.add_argument("--target", type=int, default=5, help="Target number of B items")
     p_selb.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
 
+    # merge-tags
+    p_mergetags = subparsers.add_parser("merge-tags", help="Merge concept tags from claude and gemini for usable A items")
+    p_mergetags.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
+    p_mergetags.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
+
     # coverage
     p_cov = subparsers.add_parser("coverage", help="Check concept coverage for A and B items")
     p_cov.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
@@ -2785,13 +3015,22 @@ def main():
         if not res["success"]:
             sys.exit(1)
 
+    elif args.subcommand == "merge-tags":
+        res = merge_tags_chapter(args.chapter, data_dir=args.data_dir)
+        print(guard_output(
+            f"merge-tags: updated {len(res['updated_items'])} usable A items for Chapter {args.chapter}"
+        ))
+
     elif args.subcommand == "coverage":
         rep = check_coverage_chapter(args.chapter, data_dir=args.data_dir)
         print(guard_output(f"coverage: {len(rep['concepts'])} concepts checked"))
         for c in rep["concepts"]:
             print(guard_output(f"  {c['concept_id']} ({c['title']}): usable_A={c['usable_a_count']}, selected_B={c['selected_b_count']}"))
         if not rep["success"]:
-            print(guard_output(f"coverage failure: uncovered concepts with candidates: {rep['uncovered_with_candidate']}"))
+            if rep.get("uncovered_with_candidate"):
+                print(guard_output(f"coverage failure (B): uncovered concepts with candidates: {rep['uncovered_with_candidate']}"))
+            if rep.get("uncovered_a_with_candidate"):
+                print(guard_output(f"coverage failure (A): uncovered concepts with candidates: {rep['uncovered_a_with_candidate']}"))
             sys.exit(1)
 
 

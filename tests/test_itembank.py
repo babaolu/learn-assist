@@ -40,7 +40,9 @@ from learn_assist.itembank import (
     validate_item_file,
     difficulty_screen_chapter,
     select_b_chapter,
-    check_coverage_chapter
+    check_coverage_chapter,
+    merge_tags_chapter,
+    update_b_item_statuses
 )
 
 
@@ -1651,5 +1653,220 @@ def test_b_solver_flags_unusable(tmp_path: Path):
     sel_res_no_res = select_b_chapter(1, target=2, data_dir=data_dir)
     assert "B_claude_01" not in sel_res_no_res["selected_items"]
     assert "B_claude_02" not in sel_res_no_res["selected_items"]
+
+
+def test_merge_tags_and_coverage_a(tmp_path: Path):
+    """
+    Tests merge_tags_chapter:
+    - Intersection when both families agree on some tags
+    - Union when intersection is empty
+    - Updates concepts field in items/
+    - check_coverage_chapter counts usable A items from concepts
+    - check_coverage_chapter exits non-zero if concept has 0 usable A items while candidate exists
+    """
+    data_dir = tmp_path / "data"
+    ch_dir = data_dir / "itembank" / "ch01"
+    items_dir = ch_dir / "items"
+    tags_dir = ch_dir / "tags"
+    items_dir.mkdir(parents=True)
+    tags_dir.mkdir(parents=True)
+
+    concepts = [
+        {"concept_id": "1.1", "title": "Concept 1"},
+        {"concept_id": "1.2", "title": "Concept 2"},
+        {"concept_id": "1.3", "title": "Concept 3"},
+        {"concept_id": "1.4", "title": "Concept 4"}
+    ]
+    (ch_dir / "concepts.json").write_text(json.dumps(concepts), encoding="utf-8")
+
+    # Usable A items
+    (items_dir / "A_1.01.json").write_text(json.dumps({"item_id": "A_1.01", "bucket": "A", "status": "usable"}), encoding="utf-8")
+    (items_dir / "A_1.02.json").write_text(json.dumps({"item_id": "A_1.02", "bucket": "A", "status": "usable"}), encoding="utf-8")
+    (items_dir / "A_1.03.json").write_text(json.dumps({"item_id": "A_1.03", "bucket": "A", "status": "usable"}), encoding="utf-8")
+    (ch_dir / "resolution.json").write_text(json.dumps({"usable_item_ids": ["A_1.01", "A_1.02", "A_1.03"]}), encoding="utf-8")
+
+    # Tags:
+    # A_1.01: intersection ("1.1", "1.2") & ("1.1") -> ["1.1"]
+    # A_1.02: intersection is empty -> union ("1.2") | ("1.3") -> ["1.2", "1.3"]
+    # A_1.03: gemini tagged with 1.4, claude tagged with 1.1 -> intersection empty -> ["1.1", "1.4"]
+    claude_tags = {
+        "A_1.01": ["1.1", "1.2"],
+        "A_1.02": ["1.2"],
+        "A_1.03": ["1.1"]
+    }
+    gemini_tags = {
+        "A_1.01": ["1.1"],
+        "A_1.02": ["1.3"],
+        "A_1.03": ["1.4"]
+    }
+    (tags_dir / "claude.json").write_text(json.dumps(claude_tags), encoding="utf-8")
+    (tags_dir / "gemini.json").write_text(json.dumps(gemini_tags), encoding="utf-8")
+
+    res = merge_tags_chapter(1, data_dir=data_dir)
+    assert res["usable_a_count"] == 3
+    assert "A_1.01" in res["updated_items"]
+
+    # Check written files
+    a1_data = json.loads((items_dir / "A_1.01.json").read_text(encoding="utf-8"))
+    a2_data = json.loads((items_dir / "A_1.02.json").read_text(encoding="utf-8"))
+    a3_data = json.loads((items_dir / "A_1.03.json").read_text(encoding="utf-8"))
+    assert a1_data["concepts"] == ["1.1"]
+    assert a2_data["concepts"] == ["1.2", "1.3"]
+    assert a3_data["concepts"] == ["1.1", "1.4"]
+
+    # Empty selection_b so B doesn't block coverage
+    (ch_dir / "selection_b.json").write_text(json.dumps({"selected_items": []}), encoding="utf-8")
+
+    # Now all 4 concepts have usable A coverage
+    cov = check_coverage_chapter(1, data_dir=data_dir)
+    assert cov["success"] is True
+    assert cov["uncovered_a_with_candidate"] == []
+
+    # Now simulate a gap: change A_1.03 so it does NOT cover 1.4, but tags still mention 1.4
+    a3_data["concepts"] = ["1.1"]
+    (items_dir / "A_1.03.json").write_text(json.dumps(a3_data), encoding="utf-8")
+
+    cov_fail = check_coverage_chapter(1, data_dir=data_dir)
+    assert cov_fail["success"] is False
+    assert "1.4" in cov_fail["uncovered_a_with_candidate"]
+
+    with pytest.raises(SystemExit):
+        check_coverage_chapter(1, data_dir=data_dir, exit_on_failure=True)
+
+
+def test_difficulty_screen_same_regime_anchors(tmp_path: Path):
+    """
+    Tests difficulty_screen_chapter with same-regime anchors in screen/<family>/:
+    - If screen/<family>/<anchor_id>.json exists, use it instead of keys/<family>/<anchor_id>.json
+    - Record anchor_source per item in difficulty.json
+    """
+    data_dir = tmp_path / "data"
+    ch_dir = data_dir / "itembank" / "ch01"
+    items_dir = ch_dir / "items"
+    keys_g_dir = ch_dir / "keys" / "gemini"
+    screen_g_dir = ch_dir / "screen" / "gemini"
+
+    items_dir.mkdir(parents=True)
+    keys_g_dir.mkdir(parents=True)
+    screen_g_dir.mkdir(parents=True)
+
+    # Item authored by claude -> evaluated by gemini
+    (items_dir / "B_claude_01.json").write_text(json.dumps({
+        "item_id": "B_claude_01",
+        "bucket": "B",
+        "author_family": "claude",
+        "anchor_item": "A_1.01"
+    }), encoding="utf-8")
+
+    # Gemini's key for B_claude_01 has 150 chars
+    (keys_g_dir / "B_claude_01.json").write_text(json.dumps({
+        "solution_md": "X" * 150,
+        "confidence": "medium"
+    }), encoding="utf-8")
+
+    # 1. Base anchor key has 200 chars -> B is shorter (150 < 200) -> FLAGGED
+    (keys_g_dir / "A_1.01.json").write_text(json.dumps({
+        "solution_md": "Y" * 200,
+        "confidence": "medium"
+    }), encoding="utf-8")
+
+    rep1 = difficulty_screen_chapter(1, data_dir=data_dir)
+    item1 = rep1["items"]["B_claude_01"]
+    assert item1["anchor_source"] == "keys"
+    assert item1["status"] == "flagged"
+    assert "shorter_solution" in item1["reasons"]
+    assert item1["a_chars"] == 200
+
+    # 2. Add screen anchor key with 100 chars -> B is longer (150 >= 100) -> PASSED
+    (screen_g_dir / "A_1.01.json").write_text(json.dumps({
+        "solution_md": "Z" * 100,
+        "confidence": "medium"
+    }), encoding="utf-8")
+
+    rep2 = difficulty_screen_chapter(1, data_dir=data_dir)
+    item2 = rep2["items"]["B_claude_01"]
+    assert item2["anchor_source"] == "screen"
+    assert item2["status"] == "passed"
+    assert item2["flagged"] is False
+    assert item2["a_chars"] == 100
+
+
+def test_b_item_status_updates(tmp_path: Path):
+    """
+    Tests update_b_item_statuses:
+    - selected: item in selection_b.json
+    - usable_unselected: usable in resolution, passed difficulty, but not selected
+    - flagged_difficulty: flagged in difficulty.json
+    - excluded_solver_flag: solver flag triggered in key
+    - disputed: disputed in resolution.json
+    """
+    data_dir = tmp_path / "data"
+    ch_dir = data_dir / "itembank" / "ch01"
+    items_dir = ch_dir / "items"
+    keys_g_dir = ch_dir / "keys" / "gemini"
+    items_dir.mkdir(parents=True)
+    keys_g_dir.mkdir(parents=True)
+
+    b_ids = [
+        "B_claude_01",
+        "B_claude_02",
+        "B_claude_03",
+        "B_claude_04",
+        "B_claude_05"
+    ]
+    for bid in b_ids:
+        (items_dir / f"{bid}.json").write_text(json.dumps({
+            "item_id": bid,
+            "bucket": "B",
+            "author_family": "claude",
+            "anchor_item": "A_1.01",
+            "status": "drafted"
+        }), encoding="utf-8")
+
+    # selection_b: select B_claude_01
+    (ch_dir / "selection_b.json").write_text(json.dumps({
+        "selected_items": ["B_claude_01"]
+    }), encoding="utf-8")
+
+    # difficulty: flag B_claude_03
+    (ch_dir / "difficulty.json").write_text(json.dumps({
+        "flagged_item_ids": ["B_claude_03"],
+        "items": {"B_claude_03": {"status": "flagged", "flagged": True}}
+    }), encoding="utf-8")
+
+    # solver flag: B_claude_04 has solver issue
+    (keys_g_dir / "B_claude_04.json").write_text(json.dumps({
+        "solution_md": "sol",
+        "confidence": "high",
+        "solver": {"well_posed": False, "needs_external_info": False, "issue": "ambiguous"}
+    }), encoding="utf-8")
+
+    # resolution: B_claude_01, 02, 03 usable; B_claude_05 disputed; B_claude_04 excluded_solver_flag
+    (ch_dir / "resolution.json").write_text(json.dumps({
+        "usable_item_ids": ["B_claude_01", "B_claude_02", "B_claude_03"],
+        "excluded_item_ids": ["B_claude_04", "B_claude_05"],
+        "items": {
+            "B_claude_01": {"status": "usable"},
+            "B_claude_02": {"status": "usable"},
+            "B_claude_03": {"status": "usable"},
+            "B_claude_04": {"status": "excluded_solver_flag"},
+            "B_claude_05": {"status": "excluded", "reason": "disputed"}
+        }
+    }), encoding="utf-8")
+
+    statuses = update_b_item_statuses(1, data_dir=data_dir)
+    assert statuses["B_claude_01"] == "selected"
+    assert statuses["B_claude_02"] == "usable_unselected"
+    assert statuses["B_claude_03"] == "flagged_difficulty"
+    assert statuses["B_claude_04"] == "excluded_solver_flag"
+    assert statuses["B_claude_05"] == "disputed"
+
+    # Verify on-disk files were updated
+    assert json.loads((items_dir / "B_claude_01.json").read_text(encoding="utf-8"))["status"] == "selected"
+    assert json.loads((items_dir / "B_claude_02.json").read_text(encoding="utf-8"))["status"] == "usable_unselected"
+    assert json.loads((items_dir / "B_claude_03.json").read_text(encoding="utf-8"))["status"] == "flagged_difficulty"
+    assert json.loads((items_dir / "B_claude_04.json").read_text(encoding="utf-8"))["status"] == "excluded_solver_flag"
+    assert json.loads((items_dir / "B_claude_05.json").read_text(encoding="utf-8"))["status"] == "disputed"
+
 
 
