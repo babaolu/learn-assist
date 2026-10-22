@@ -416,15 +416,25 @@ def validate_item(
             ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
         except Exception:
             pass
+
+    # Infer from item file folder (data/itembank/chNN/...)
+    if ch_num is None and file_path is not None:
+        for part in reversed(file_path.parts):
+            m_ch = re.search(r'ch(\d+)', part)
+            if m_ch:
+                ch_num = int(m_ch.group(1))
+                break
+        if ch_num is None:
+            m_full = re.search(r'ch(\d+)', str(file_path))
+            if m_full:
+                ch_num = int(m_full.group(1))
+
+    # Infer from item_id or anchor_item if still not found
     if ch_num is None:
-        for cand in [data.get("anchor_item", ""), item_id, str(file_path) if file_path else ""]:
+        for cand in [item_id, data.get("anchor_item", "")]:
             m = re.search(r'[A-Za-z]_(\d+)\.', str(cand))
             if m:
                 ch_num = int(m.group(1))
-                break
-            m_ch = re.search(r'ch(\d+)', str(cand))
-            if m_ch:
-                ch_num = int(m_ch.group(1))
                 break
 
     # Resolve valid concepts
@@ -545,7 +555,17 @@ def validate_item_file(
     except Exception as e:
         return False, [f"JSON parse error: {e}"]
 
-    d_dir = data_dir or file_path.parent.parent.parent.parent
+    d_dir = data_dir
+    if d_dir is None:
+        p_res = file_path.resolve()
+        if "itembank" in p_res.parts:
+            idx = p_res.parts.index("itembank")
+            d_dir = Path(*p_res.parts[:idx])
+            if not d_dir.is_absolute() and p_res.is_absolute():
+                d_dir = Path("/") / d_dir
+        else:
+            d_dir = Path("data")
+
     return validate_item(
         data,
         chapter=chapter,
@@ -613,7 +633,11 @@ def parse_expr_convention(expr_str: str) -> Any:
     return parse_expr(expr_str, local_dict=local_dict)
 
 
-def validate_key(data: Dict[str, Any], file_path: Optional[Path] = None) -> Tuple[bool, List[str]]:
+def validate_key(
+    data: Dict[str, Any],
+    file_path: Optional[Path] = None,
+    data_dir: Optional[Path] = None
+) -> Tuple[bool, List[str]]:
     """
     Validates key data according to schema:
     {"item_id", "model_family": "claude"|"gemini", "model_id", "solved_at",
@@ -683,6 +707,63 @@ def validate_key(data: Dict[str, Any], file_path: Optional[Path] = None) -> Tupl
                     except Exception:
                         errors.append(f"final_answers[{idx}] rel_tol must be float")
 
+    # Solver block validation: required for key on item the family did not author
+    item_id = str(data.get("item_id", ""))
+    key_family = str(data.get("model_family", "")).lower()
+
+    is_non_author = False
+    m_author = re.match(r'^B_([a-zA-Z0-9]+)_', item_id)
+    if m_author:
+        author_family = m_author.group(1).lower()
+        if key_family and author_family != key_family:
+            is_non_author = True
+    elif file_path or data_dir:
+        possible_items = []
+        if file_path:
+            possible_items.append(file_path.parent.parent.parent / "items" / f"{item_id}.json")
+        if data_dir:
+            for item_p in (data_dir / "itembank").glob(f"*/items/{item_id}.json"):
+                possible_items.append(item_p)
+        for it_p in possible_items:
+            if it_p.exists():
+                try:
+                    it_data = json.loads(it_p.read_text(encoding="utf-8"))
+                    it_author = str(it_data.get("author_family", "")).lower()
+                    if it_author and key_family and it_author != key_family:
+                        is_non_author = True
+                        break
+                except Exception:
+                    pass
+
+    if "author_family" in data:
+        it_author = str(data.get("author_family", "")).lower()
+        if it_author and key_family and it_author != key_family:
+            is_non_author = True
+
+    if is_non_author:
+        if "solver" not in data:
+            errors.append("Missing required 'solver' block for key on item authored by another family")
+
+    if "solver" in data:
+        solver = data["solver"]
+        if not isinstance(solver, dict):
+            errors.append("'solver' must be a dictionary")
+        else:
+            if "well_posed" not in solver:
+                errors.append("Missing required 'well_posed' in 'solver' block")
+            elif not isinstance(solver["well_posed"], bool):
+                errors.append("'solver.well_posed' must be a boolean")
+
+            if "needs_external_info" not in solver:
+                errors.append("Missing required 'needs_external_info' in 'solver' block")
+            elif not isinstance(solver["needs_external_info"], bool):
+                errors.append("'solver.needs_external_info' must be a boolean")
+
+            if "issue" not in solver:
+                errors.append("Missing required 'issue' in 'solver' block")
+            elif not isinstance(solver["issue"], str):
+                errors.append("'solver.issue' must be a string")
+
     # File path validation if provided
     if file_path:
         expected_stem = data.get("item_id")
@@ -695,7 +776,7 @@ def validate_key(data: Dict[str, Any], file_path: Optional[Path] = None) -> Tupl
     return len(errors) == 0, errors
 
 
-def validate_key_file(file_path: Path) -> Tuple[bool, List[str]]:
+def validate_key_file(file_path: Path, data_dir: Optional[Path] = None) -> Tuple[bool, List[str]]:
     """Loads and validates a key JSON file."""
     if not file_path.exists():
         return False, [f"File not found: {file_path}"]
@@ -703,7 +784,7 @@ def validate_key_file(file_path: Path) -> Tuple[bool, List[str]]:
         data = json.loads(file_path.read_text(encoding="utf-8"))
     except Exception as e:
         return False, [f"JSON decode error: {e}"]
-    return validate_key(data, file_path=file_path)
+    return validate_key(data, file_path=file_path, data_dir=data_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -1736,10 +1817,11 @@ def difficulty_screen_chapter(
     data_dir: Path = Path("data")
 ) -> Dict[str, Any]:
     """
-    For each B item and solving family (keys/<family>/B_*.json),
-    compares B solution with same family's anchor A key.
+    For each B item, uses ONLY the non-author family's key to evaluate difficulty
+    against that family's anchor A key.
     Flag if B solution_md is shorter in chars OR confidence is higher (low < medium < high).
-    Writes difficulty.json. Item flagged if either family flags it.
+    An item with no non-author key is "unscreened", never "pass".
+    Writes difficulty.json.
     """
     ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
     ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}"
@@ -1758,87 +1840,122 @@ def difficulty_screen_chapter(
     conf_rank = {"low": 1, "medium": 2, "high": 3}
     flagged_ids: List[str] = []
     passed_ids: List[str] = []
+    unscreened_ids: List[str] = []
     results: Dict[str, Any] = {}
 
     for b_item in b_items:
         item_id = b_item.get("item_id", "")
         anchor_id = b_item.get("anchor_item", "")
-        family_flags: Dict[str, Any] = {}
-        item_flagged = False
 
-        for family in ["claude", "gemini"]:
-            b_key_file = ch_dir / "keys" / family / f"{item_id}.json"
-            a_key_file = ch_dir / "keys" / family / f"{anchor_id}.json"
+        # Identify author family
+        author_family = b_item.get("author_family")
+        if not author_family:
+            m = re.match(r'^B_([a-zA-Z0-9]+)_', item_id)
+            if m:
+                author_family = m.group(1).lower()
+        if author_family:
+            author_family = author_family.lower()
 
-            if b_key_file.exists():
-                try:
-                    b_key = json.loads(b_key_file.read_text(encoding="utf-8"))
-                except Exception:
-                    b_key = {}
-                b_sol = b_key.get("solution_md", "")
-                b_conf = b_key.get("confidence", "low").lower()
-                b_len = len(b_sol)
+        # Non-author family evaluates the item
+        if author_family == "claude":
+            eval_family = "gemini"
+        elif author_family == "gemini":
+            eval_family = "claude"
+        else:
+            eval_family = "gemini" if "claude" in item_id else "claude"
 
-                if a_key_file.exists():
-                    try:
-                        a_key = json.loads(a_key_file.read_text(encoding="utf-8"))
-                    except Exception:
-                        a_key = {}
-                    a_sol = a_key.get("solution_md", "")
-                    a_conf = a_key.get("confidence", "low").lower()
-                    a_len = len(a_sol)
+        b_key_file = ch_dir / "keys" / eval_family / f"{item_id}.json"
+        a_key_file = ch_dir / "keys" / eval_family / f"{anchor_id}.json"
 
-                    reasons = []
-                    if b_len < a_len:
-                        reasons.append("shorter_solution")
-                    if conf_rank.get(b_conf, 1) > conf_rank.get(a_conf, 1):
-                        reasons.append("higher_confidence")
+        # If no non-author key exists -> unscreened, never pass
+        if not b_key_file.exists():
+            unscreened_ids.append(item_id)
+            results[item_id] = {
+                "anchor_item": anchor_id,
+                "author_family": author_family,
+                "evaluating_family": eval_family,
+                "status": "unscreened",
+                "flagged": False,
+                "reasons": ["no_non_author_key"]
+            }
+            continue
 
-                    fam_flagged = len(reasons) > 0
-                    if fam_flagged:
-                        item_flagged = True
+        try:
+            b_key = json.loads(b_key_file.read_text(encoding="utf-8"))
+        except Exception:
+            b_key = {}
+        b_sol = b_key.get("solution_md", "")
+        b_conf = b_key.get("confidence", "low").lower()
+        b_len = len(b_sol)
 
-                    family_flags[family] = {
-                        "flagged": fam_flagged,
-                        "reasons": reasons,
-                        "b_chars": b_len,
-                        "a_chars": a_len,
-                        "b_confidence": b_conf,
-                        "a_confidence": a_conf
-                    }
-                else:
-                    item_flagged = True
-                    family_flags[family] = {
-                        "flagged": True,
-                        "reasons": ["missing_anchor_key"],
-                        "b_chars": b_len
-                    }
-            else:
-                family_flags[family] = {
-                    "flagged": False,
-                    "reasons": ["no_b_key"]
-                }
+        if not a_key_file.exists():
+            flagged_ids.append(item_id)
+            results[item_id] = {
+                "anchor_item": anchor_id,
+                "author_family": author_family,
+                "evaluating_family": eval_family,
+                "status": "flagged",
+                "flagged": True,
+                "reasons": ["missing_anchor_key"],
+                "b_chars": b_len
+            }
+            continue
 
+        try:
+            a_key = json.loads(a_key_file.read_text(encoding="utf-8"))
+        except Exception:
+            a_key = {}
+        a_sol = a_key.get("solution_md", "")
+        a_conf = a_key.get("confidence", "low").lower()
+        a_len = len(a_sol)
+
+        reasons = []
+        if b_len < a_len:
+            reasons.append("shorter_solution")
+        if conf_rank.get(b_conf, 1) > conf_rank.get(a_conf, 1):
+            reasons.append("higher_confidence")
+
+        item_flagged = len(reasons) > 0
         if item_flagged:
             flagged_ids.append(item_id)
+            results[item_id] = {
+                "anchor_item": anchor_id,
+                "author_family": author_family,
+                "evaluating_family": eval_family,
+                "status": "flagged",
+                "flagged": True,
+                "reasons": reasons,
+                "b_chars": b_len,
+                "a_chars": a_len,
+                "b_confidence": b_conf,
+                "a_confidence": a_conf
+            }
         else:
             passed_ids.append(item_id)
-
-        results[item_id] = {
-            "anchor_item": anchor_id,
-            "flagged": item_flagged,
-            "flags": family_flags
-        }
+            results[item_id] = {
+                "anchor_item": anchor_id,
+                "author_family": author_family,
+                "evaluating_family": eval_family,
+                "status": "passed",
+                "flagged": False,
+                "reasons": [],
+                "b_chars": b_len,
+                "a_chars": a_len,
+                "b_confidence": b_conf,
+                "a_confidence": a_conf
+            }
 
     report = {
         "chapter": ch_num,
         "summary": {
             "total_b_items": len(b_items),
             "flagged_items": len(flagged_ids),
-            "passed_items": len(passed_ids)
+            "passed_items": len(passed_ids),
+            "unscreened_items": len(unscreened_ids)
         },
         "flagged_item_ids": flagged_ids,
         "passed_item_ids": passed_ids,
+        "unscreened_item_ids": unscreened_ids,
         "items": results
     }
 
@@ -1882,6 +1999,7 @@ def select_b_chapter(
     else:
         diff_data = difficulty_screen_chapter(ch_num, data_dir=data_dir)
     flagged_ids = set(diff_data.get("flagged_item_ids", []))
+    unscreened_ids = set(diff_data.get("unscreened_item_ids", []))
 
     # Load usable items from resolution.json if available
     res_file = ch_dir / "resolution.json"
@@ -1905,7 +2023,7 @@ def select_b_chapter(
             if data.get("bucket") != "B" and not p.name.startswith("B_"):
                 continue
             item_id = data.get("item_id", p.stem)
-            if item_id in flagged_ids:
+            if item_id in flagged_ids or item_id in unscreened_ids:
                 continue
             if resolution_usable is not None and item_id in resolution_usable:
                 candidate_items.append(data)
@@ -2428,6 +2546,7 @@ def main():
     # validate-item
     p_valitem = subparsers.add_parser("validate-item", help="Validate an item JSON file against schema")
     p_valitem.add_argument("item_file", type=Path, help="Path to item JSON file")
+    p_valitem.add_argument("--chapter", help="Chapter number (optional, e.g. 3, 03, ch03)")
     p_valitem.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
 
     # difficulty-screen
@@ -2533,7 +2652,7 @@ def main():
             print(guard_output(f"  {c['concept_id']}: {c['title']}"))
 
     elif args.subcommand == "validate-item":
-        valid, errors = validate_item_file(args.item_file, data_dir=args.data_dir)
+        valid, errors = validate_item_file(args.item_file, chapter=args.chapter, data_dir=args.data_dir)
         if valid:
             print(guard_output(f"VALID: {args.item_file.name}"))
             sys.exit(0)
@@ -2545,7 +2664,7 @@ def main():
         rep = difficulty_screen_chapter(args.chapter, data_dir=args.data_dir)
         s = rep["summary"]
         print(guard_output(
-            f"difficulty-screen: total={s['total_b_items']}, flagged={s['flagged_items']}, passed={s['passed_items']}"
+            f"difficulty-screen: total={s['total_b_items']}, flagged={s['flagged_items']}, passed={s['passed_items']}, unscreened={s.get('unscreened_items', 0)}"
         ))
 
     elif args.subcommand == "select-b":

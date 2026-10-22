@@ -1263,56 +1263,66 @@ def test_difficulty_screen_flags(tmp_path: Path):
     (keys_c / "A_1.01.json").write_text(json.dumps(a_key_c), encoding="utf-8")
     (keys_g / "A_1.01.json").write_text(json.dumps(a_key_g), encoding="utf-8")
 
-    # Item 1: shorter solution (100 chars < 200) -> flagged by claude
+    # Item 1: non-author gemini key is shorter (100 chars < 200) -> flagged
     (items_dir / "B_claude_01.json").write_text(json.dumps({
-        "item_id": "B_claude_01", "bucket": "B", "anchor_item": "A_1.01"
+        "item_id": "B_claude_01", "bucket": "B", "anchor_item": "A_1.01", "author_family": "claude"
     }), encoding="utf-8")
     (keys_c / "B_claude_01.json").write_text(json.dumps({
-        "solution_md": "S" * 100, "confidence": "medium"
+        "solution_md": "S" * 250, "confidence": "medium"
     }), encoding="utf-8")
     (keys_g / "B_claude_01.json").write_text(json.dumps({
-        "solution_md": "S" * 250, "confidence": "medium"
+        "solution_md": "S" * 100, "confidence": "medium"
     }), encoding="utf-8")
 
-    # Item 2: higher confidence ("high" > "medium") -> flagged by claude
+    # Item 2: non-author gemini key has higher confidence ("high" > "medium") -> flagged
     (items_dir / "B_claude_02.json").write_text(json.dumps({
-        "item_id": "B_claude_02", "bucket": "B", "anchor_item": "A_1.01"
+        "item_id": "B_claude_02", "bucket": "B", "anchor_item": "A_1.01", "author_family": "claude"
     }), encoding="utf-8")
     (keys_c / "B_claude_02.json").write_text(json.dumps({
-        "solution_md": "S" * 250, "confidence": "high"
+        "solution_md": "S" * 250, "confidence": "medium"
     }), encoding="utf-8")
     (keys_g / "B_claude_02.json").write_text(json.dumps({
-        "solution_md": "S" * 250, "confidence": "medium"
+        "solution_md": "S" * 250, "confidence": "high"
     }), encoding="utf-8")
 
-    # Item 3: longer solution and lower confidence ("low" < "medium") -> PASSES
+    # Item 3: non-author gemini key is longer and lower confidence ("low" < "medium") -> PASSES
     (items_dir / "B_claude_03.json").write_text(json.dumps({
-        "item_id": "B_claude_03", "bucket": "B", "anchor_item": "A_1.01"
+        "item_id": "B_claude_03", "bucket": "B", "anchor_item": "A_1.01", "author_family": "claude"
     }), encoding="utf-8")
     (keys_c / "B_claude_03.json").write_text(json.dumps({
-        "solution_md": "S" * 250, "confidence": "low"
+        "solution_md": "S" * 100, "confidence": "high"  # author key is ignored
     }), encoding="utf-8")
     (keys_g / "B_claude_03.json").write_text(json.dumps({
-        "solution_md": "S" * 250, "confidence": "medium"
+        "solution_md": "S" * 250, "confidence": "low"
     }), encoding="utf-8")
 
-    # Item 4: longer solution and equal confidence ("medium" == "medium") -> PASSES
+    # Item 4: non-author claude key is longer and equal confidence ("medium" == "medium") -> PASSES
     (items_dir / "B_gemini_01.json").write_text(json.dumps({
-        "item_id": "B_gemini_01", "bucket": "B", "anchor_item": "A_1.01"
+        "item_id": "B_gemini_01", "bucket": "B", "anchor_item": "A_1.01", "author_family": "gemini"
     }), encoding="utf-8")
     (keys_c / "B_gemini_01.json").write_text(json.dumps({
         "solution_md": "S" * 250, "confidence": "medium"
     }), encoding="utf-8")
     (keys_g / "B_gemini_01.json").write_text(json.dumps({
-        "solution_md": "S" * 250, "confidence": "medium"
+        "solution_md": "S" * 100, "confidence": "high"  # author key is ignored
+    }), encoding="utf-8")
+
+    # Item 5: item with no non-author key -> UNSCREENED
+    (items_dir / "B_gemini_02.json").write_text(json.dumps({
+        "item_id": "B_gemini_02", "bucket": "B", "anchor_item": "A_1.01", "author_family": "gemini"
+    }), encoding="utf-8")
+    (keys_g / "B_gemini_02.json").write_text(json.dumps({
+        "solution_md": "S" * 300, "confidence": "low"
     }), encoding="utf-8")
 
     rep = difficulty_screen_chapter(1, data_dir=data_dir)
     assert (ch_dir / "difficulty.json").exists()
     assert set(rep["flagged_item_ids"]) == {"B_claude_01", "B_claude_02"}
     assert set(rep["passed_item_ids"]) == {"B_claude_03", "B_gemini_01"}
+    assert set(rep["unscreened_item_ids"]) == {"B_gemini_02"}
     assert rep["summary"]["flagged_items"] == 2
     assert rep["summary"]["passed_items"] == 2
+    assert rep["summary"]["unscreened_items"] == 1
 
 
 def test_select_b_coverage_and_threshold(tmp_path: Path):
@@ -1418,4 +1428,118 @@ def test_weak_review_warning(tmp_path: Path):
     assert "Family review agreement:" in rep_b
     assert "80.0%" in rep_b
     assert "WARNING: WEAK-REVIEW" not in rep_b
+
+
+def test_validate_b_item_chapter_inference_and_cli(tmp_path: Path):
+    """
+    Tests that validate_item_file correctly infers chapter from folder path
+    and accepts explicit chapter argument for B_<family>_NN items.
+    """
+    data_dir = tmp_path / "data"
+    ch_dir = data_dir / "itembank" / "ch01"
+    items_dir = ch_dir / "items"
+    items_dir.mkdir(parents=True)
+
+    # Concepts file
+    (ch_dir / "concepts.json").write_text(json.dumps([{"concept_id": "1.1", "title": "Concept 1"}]), encoding="utf-8")
+    # Resolution file with usable anchors
+    (ch_dir / "resolution.json").write_text(json.dumps({"usable_item_ids": ["A_1.01"]}), encoding="utf-8")
+
+    item_data = {
+        "item_id": "B_gemini_01",
+        "bucket": "B",
+        "author_family": "gemini",
+        "author_model_id": "gemini-3.8-flash",
+        "statement_md": "Calculate the precession frequency in a magnetic field.",
+        "anchor_item": "A_1.01",
+        "criteria": [1, 2],
+        "criteria_justification": {"1": "criterion 1", "2": "criterion 2"},
+        "concepts": ["1.1"],
+        "status": "drafted"
+    }
+    item_file = items_dir / "B_gemini_01.json"
+    item_file.write_text(json.dumps(item_data), encoding="utf-8")
+
+    # 1. Validate with explicit chapter
+    val, errs = validate_item_file(item_file, chapter=1, data_dir=data_dir)
+    assert val is True, f"Errors: {errs}"
+
+    # 2. Validate without explicit chapter (infer from folder 'ch01')
+    val_inf, errs_inf = validate_item_file(item_file, data_dir=data_dir)
+    assert val_inf is True, f"Inferred errors: {errs_inf}"
+
+
+def test_key_solver_block_schema(tmp_path: Path):
+    """
+    Tests solver block requirements:
+    - Required for any key on an item the family did not author
+    - Not required for key on item authored by the same family
+    - Validates well_posed (bool), needs_external_info (bool), issue (str)
+    """
+    # 1. Authored item (gemini key for B_gemini_01): no solver block required
+    own_key = {
+        "item_id": "B_gemini_01", "model_family": "gemini", "model_id": "gemini-3.8-flash",
+        "solved_at": "2026-10-22T10:00:00Z", "solution_md": "...", "final_answers": [],
+        "assumptions": [], "confidence": "high"
+    }
+    v_own, e_own = validate_key(own_key)
+    assert v_own is True, f"Errors: {e_own}"
+
+    # 2. Non-authored item (gemini key for B_claude_01): solver block required
+    non_auth_key = {
+        "item_id": "B_claude_01", "model_family": "gemini", "model_id": "gemini-3.8-flash",
+        "solved_at": "2026-10-22T10:00:00Z", "solution_md": "...", "final_answers": [],
+        "assumptions": [], "confidence": "high"
+    }
+    v_na, e_na = validate_key(non_auth_key)
+    assert v_na is False
+    assert any("Missing required 'solver' block" in e for e in e_na)
+
+    # 3. Non-authored item with valid solver block: passes
+    valid_solver_key = dict(non_auth_key)
+    valid_solver_key["solver"] = {
+        "well_posed": True,
+        "needs_external_info": False,
+        "issue": ""
+    }
+    v_ok, e_ok = validate_key(valid_solver_key)
+    assert v_ok is True, f"Errors: {e_ok}"
+
+    # 4. Invalid solver block fields
+    bad_solver_key = dict(non_auth_key)
+    bad_solver_key["solver"] = {
+        "well_posed": "not_a_bool",
+        "needs_external_info": False,
+        "issue": ""
+    }
+    v_bad, e_bad = validate_key(bad_solver_key)
+    assert v_bad is False
+    assert any("'solver.well_posed' must be a boolean" in e for e in e_bad)
+
+
+def test_difficulty_screen_unscreened(tmp_path: Path):
+    """
+    Tests that items with no non-author key are marked 'unscreened' and never 'pass'.
+    """
+    data_dir = tmp_path / "data"
+    ch_dir = data_dir / "itembank" / "ch01"
+    items_dir = ch_dir / "items"
+    keys_g = ch_dir / "keys" / "gemini"
+    items_dir.mkdir(parents=True)
+    keys_g.mkdir(parents=True)
+
+    # Base anchor A key for gemini
+    (keys_g / "A_1.01.json").write_text(json.dumps({"solution_md": "Y" * 200, "confidence": "medium"}), encoding="utf-8")
+
+    # B item authored by claude, but NO gemini key exists
+    (items_dir / "B_claude_01.json").write_text(json.dumps({
+        "item_id": "B_claude_01", "bucket": "B", "anchor_item": "A_1.01", "author_family": "claude"
+    }), encoding="utf-8")
+
+    rep = difficulty_screen_chapter(1, data_dir=data_dir)
+    assert rep["summary"]["unscreened_items"] == 1
+    assert "B_claude_01" in rep["unscreened_item_ids"]
+    assert "B_claude_01" not in rep["passed_item_ids"]
+    assert "B_claude_01" not in rep["flagged_item_ids"]
+    assert rep["items"]["B_claude_01"]["status"] == "unscreened"
 
