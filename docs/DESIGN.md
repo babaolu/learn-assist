@@ -44,10 +44,10 @@ and at least one Bucket B item. Target 60/40 A:B by count, minimum 5 B items.
 The headline result is the Bucket B score.
 
 # TEST INTEGRITY
-- Free response only. No multiple choice.
+- Free response only. No multiple choice. Choice-type answer slots are a grading format only; the learner is never shown answer options.
 - Two models from DIFFERENT families independently write questions and answer
   each other's from the source text. Agreement means the item is sound;
-  disagreement surfaces to the user; an unanswerable item is discarded.
+  disagreement surfaces to the user as item IDs and counts only; item content is revealed only after the learner's testing for that chapter is complete (see BLINDING.md); an unanswerable item is discarded.
 - Grading uses a rubric derived from the source text. Both models grade
   independently; disagreements surface to the user rather than being averaged.
 - Raw learner answers are stored verbatim for later re-grading.

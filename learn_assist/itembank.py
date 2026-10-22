@@ -298,13 +298,262 @@ def extract_chapter_a(
     return written_count, item_ids, warnings
 
 
-# ---------------------------------------------------------------------------
-# Key Schema & Validator
-# ---------------------------------------------------------------------------
-
 VALID_MODEL_FAMILIES = {"claude", "gemini"}
 VALID_CONFIDENCES = {"high", "medium", "low"}
 VALID_KINDS = {"numeric", "expression", "choice", "text"}
+
+
+# ---------------------------------------------------------------------------
+# Concepts Extraction & Tagging
+# ---------------------------------------------------------------------------
+
+def extract_concepts_from_chapter(
+    chapter: Any,
+    data_dir: Path = Path("data")
+) -> List[Dict[str, str]]:
+    """
+    Lists the major concepts from the corrected chapter's section headings.
+    Each lowest-level numbered section (3.x.y, or 3.x if it has no subsections)
+    is one concept. Writes data/itembank/chXX/concepts.json as:
+    [{"concept_id": "3.2.5", "title": ...}].
+    """
+    ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+    chapter_file = data_dir / "chapters" / f"chapter_{ch_num:02d}.md"
+    if not chapter_file.exists():
+        raise FileNotFoundError(f"Chapter file not found: {chapter_file}")
+
+    full_text = chapter_file.read_text(encoding="utf-8")
+    sections: Dict[str, str] = {}
+    for line in full_text.splitlines():
+        # Match ## 3.1 ..., ### 3.1.1 ..., ## Section 3.1 ...
+        # Ensure we do not match 3.2.5.1 when looking for 3.2.5 via (?!\.\d)
+        m = re.match(rf'^(?:#+)\s+(?:Section\s+)?({ch_num}\.\d+(?:\.\d+)?)(?!\.\d)\s*(.*)', line.strip())
+        if m:
+            sec = m.group(1)
+            raw_title = m.group(2).strip()
+            title = re.sub(r'\s+\d+$', '', raw_title).strip()
+            title = re.sub(r'^[\*\#\-\s]+', '', title)
+            title = re.sub(r'[\*\#\-\s]+$', '', title)
+            if sec not in sections and title:
+                sections[sec] = title
+
+    concepts: List[Dict[str, str]] = []
+    sec_keys = list(sections.keys())
+    for sec, title in sections.items():
+        parts = sec.split('.')
+        if len(parts) == 3:  # 3.x.y
+            concepts.append({"concept_id": sec, "title": title})
+        elif len(parts) == 2:  # 3.x
+            has_sub = any(s.startswith(f"{sec}.") for s in sec_keys if s != sec)
+            if not has_sub:
+                concepts.append({"concept_id": sec, "title": title})
+
+    ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}"
+    ch_dir.mkdir(parents=True, exist_ok=True)
+    out_file = ch_dir / "concepts.json"
+    out_file.write_text(json.dumps(concepts, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    return concepts
+
+
+def check_statement_option_lists(text: str) -> bool:
+    """
+    Checks if statement_md contains option lists:
+    - 'which of the following' (case-insensitive)
+    - (A)...(B)... or (a)...(b)...
+    """
+    if re.search(r'\bwhich of the following\b', text, re.IGNORECASE):
+        return True
+    if re.search(r'\([A-D]\)[\s\S]*?\([B-D]\)', text):
+        return True
+    if re.search(r'\([a-d]\)[\s\S]*?\([b-d]\)', text):
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Item Schema & Validator (Bucket A & Bucket B)
+# ---------------------------------------------------------------------------
+
+def validate_item(
+    data: Dict[str, Any],
+    chapter: Optional[Any] = None,
+    data_dir: Path = Path("data"),
+    concepts: Optional[List[str]] = None,
+    usable_anchors: Optional[Set[str]] = None,
+    file_path: Optional[Path] = None
+) -> Tuple[bool, List[str]]:
+    """
+    Validates an item JSON against schema:
+    Bucket A items:
+      - item_id, bucket: "A", optional "concepts" [concept_id, ...]
+    Bucket B items:
+      - item_id, bucket: "B", author_family, author_model_id, statement_md,
+        anchor_item, criteria: [1..6], criteria_justification: {"<n>": ...},
+        concepts: [...], status: "drafted" (or similar)
+      - >= 2 distinct criteria from 1..6
+      - anchor_item is a usable Bucket A item in resolution.json
+      - concepts non-empty and valid
+      - statement_md contains NO option lists
+    """
+    errors: List[str] = []
+
+    if not isinstance(data, dict):
+        return False, ["Item data must be a JSON object"]
+
+    item_id = data.get("item_id")
+    if not item_id or not isinstance(item_id, str):
+        errors.append("item_id is required and must be a string")
+
+    bucket = data.get("bucket")
+    if bucket not in {"A", "B"}:
+        errors.append("bucket must be 'A' or 'B'")
+
+    # Infer chapter if not provided
+    ch_num: Optional[int] = None
+    if chapter is not None:
+        try:
+            ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+        except Exception:
+            pass
+    if ch_num is None:
+        cand_str = item_id or data.get("anchor_item", "")
+        m = re.search(r'[A-Za-z]_(\d+)\.', str(cand_str))
+        if m:
+            ch_num = int(m.group(1))
+
+    # Resolve valid concepts
+    valid_concept_set: Optional[Set[str]] = None
+    if concepts is not None:
+        valid_concept_set = set(concepts)
+    elif ch_num is not None:
+        c_file = data_dir / "itembank" / f"ch{ch_num:02d}" / "concepts.json"
+        if c_file.exists():
+            try:
+                c_data = json.loads(c_file.read_text(encoding="utf-8"))
+                valid_concept_set = {c["concept_id"] for c in c_data if "concept_id" in c}
+            except Exception:
+                pass
+
+    # Check concepts if present
+    item_concepts = data.get("concepts")
+    if item_concepts is not None:
+        if not isinstance(item_concepts, list) or not all(isinstance(c, str) for c in item_concepts):
+            errors.append("concepts must be a list of strings")
+        elif valid_concept_set is not None:
+            for c in item_concepts:
+                if c not in valid_concept_set:
+                    errors.append(f"Unknown concept ID: {c}")
+
+    # Specific Bucket B checks
+    if bucket == "B":
+        author_family = data.get("author_family")
+        if author_family not in VALID_MODEL_FAMILIES:
+            errors.append(f"author_family must be one of {sorted(VALID_MODEL_FAMILIES)}, got {author_family}")
+
+        author_model_id = data.get("author_model_id")
+        if not author_model_id or not isinstance(author_model_id, str):
+            errors.append("author_model_id is required and must be a string")
+
+        statement_md = data.get("statement_md")
+        if not statement_md or not isinstance(statement_md, str) or not statement_md.strip():
+            errors.append("statement_md is required and cannot be empty")
+        elif check_statement_option_lists(statement_md):
+            errors.append("statement_md contains option list or 'which of the following'")
+
+        # concepts: non-empty and valid
+        if not item_concepts or not isinstance(item_concepts, list) or len(item_concepts) == 0:
+            errors.append("concepts must be a non-empty list of concept IDs for Bucket B items")
+
+        # anchor_item: must be usable Bucket A item in resolution.json
+        anchor = data.get("anchor_item")
+        if not anchor or not isinstance(anchor, str):
+            errors.append("anchor_item is required and must be a string")
+        else:
+            if not anchor.startswith("A_"):
+                errors.append(f"anchor_item '{anchor}' must be a Bucket A item (starting with 'A_')")
+            valid_anchors_set: Optional[Set[str]] = None
+            if usable_anchors is not None:
+                valid_anchors_set = set(usable_anchors)
+            elif ch_num is not None:
+                res_file = data_dir / "itembank" / f"ch{ch_num:02d}" / "resolution.json"
+                if res_file.exists():
+                    try:
+                        res_data = json.loads(res_file.read_text(encoding="utf-8"))
+                        valid_anchors_set = set(res_data.get("usable_item_ids", []))
+                    except Exception:
+                        pass
+            if valid_anchors_set is not None:
+                if anchor not in valid_anchors_set:
+                    errors.append(f"anchor_item '{anchor}' is not a usable Bucket A item in resolution.json")
+            else:
+                errors.append(f"anchor_item '{anchor}' cannot be verified: resolution.json not found")
+
+        # criteria: >= 2 distinct criteria from 1..6
+        crit = data.get("criteria")
+        if not isinstance(crit, list):
+            errors.append("criteria must be a list of integers from 1..6")
+        else:
+            distinct_crit: Set[int] = set()
+            crit_valid = True
+            for c in crit:
+                if not isinstance(c, int) or c < 1 or c > 6:
+                    crit_valid = False
+                    errors.append(f"Invalid criterion {c}: must be integer in 1..6")
+                else:
+                    distinct_crit.add(c)
+            if crit_valid and len(distinct_crit) < 2:
+                errors.append(f"criteria must contain at least 2 distinct criteria from 1..6, got {len(distinct_crit)}")
+
+        # criteria_justification: {"<n>": ...}
+        crit_just = data.get("criteria_justification")
+        if not isinstance(crit_just, dict):
+            errors.append("criteria_justification must be a dictionary")
+        elif isinstance(crit, list):
+            for c in crit:
+                c_str = str(c)
+                val = crit_just.get(c_str) or crit_just.get(c)
+                if not val or not str(val).strip():
+                    errors.append(f"Missing or empty criteria_justification for criterion {c}")
+
+        status = data.get("status")
+        if not status or not isinstance(status, str):
+            errors.append("status is required and must be a string")
+
+    return len(errors) == 0, errors
+
+
+def validate_item_file(
+    file_path: Path,
+    chapter: Optional[Any] = None,
+    data_dir: Optional[Path] = None,
+    concepts: Optional[List[str]] = None,
+    usable_anchors: Optional[Set[str]] = None
+) -> Tuple[bool, List[str]]:
+    """
+    Validates an item JSON file.
+    """
+    if not file_path.exists():
+        return False, [f"Item file not found: {file_path}"]
+    try:
+        data = json.loads(file_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return False, [f"JSON parse error: {e}"]
+
+    d_dir = data_dir or file_path.parent.parent.parent.parent
+    return validate_item(
+        data,
+        chapter=chapter,
+        data_dir=d_dir,
+        concepts=concepts,
+        usable_anchors=usable_anchors,
+        file_path=file_path
+    )
+
+
+# ---------------------------------------------------------------------------
+# Key Schema & Validator
+# ---------------------------------------------------------------------------
 
 POSITIVE_CONVENTION_SYMBOLS: Set[str] = {
     "gamma", "gammabar", "hbar", "h", "K", "B0", "B1",
@@ -1474,6 +1723,368 @@ def resolve_chapter(
 
 
 # ---------------------------------------------------------------------------
+# Bucket B Difficulty Screening
+# ---------------------------------------------------------------------------
+
+def difficulty_screen_chapter(
+    chapter: Any,
+    data_dir: Path = Path("data")
+) -> Dict[str, Any]:
+    """
+    For each B item and solving family (keys/<family>/B_*.json),
+    compares B solution with same family's anchor A key.
+    Flag if B solution_md is shorter in chars OR confidence is higher (low < medium < high).
+    Writes difficulty.json. Item flagged if either family flags it.
+    """
+    ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+    ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}"
+    items_dir = ch_dir / "items"
+
+    b_items: List[Dict[str, Any]] = []
+    if items_dir.exists():
+        for p in sorted(items_dir.glob("*.json")):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if data.get("bucket") == "B" or p.name.startswith("B_"):
+                    b_items.append(data)
+            except Exception:
+                continue
+
+    conf_rank = {"low": 1, "medium": 2, "high": 3}
+    flagged_ids: List[str] = []
+    passed_ids: List[str] = []
+    results: Dict[str, Any] = {}
+
+    for b_item in b_items:
+        item_id = b_item.get("item_id", "")
+        anchor_id = b_item.get("anchor_item", "")
+        family_flags: Dict[str, Any] = {}
+        item_flagged = False
+
+        for family in ["claude", "gemini"]:
+            b_key_file = ch_dir / "keys" / family / f"{item_id}.json"
+            a_key_file = ch_dir / "keys" / family / f"{anchor_id}.json"
+
+            if b_key_file.exists():
+                try:
+                    b_key = json.loads(b_key_file.read_text(encoding="utf-8"))
+                except Exception:
+                    b_key = {}
+                b_sol = b_key.get("solution_md", "")
+                b_conf = b_key.get("confidence", "low").lower()
+                b_len = len(b_sol)
+
+                if a_key_file.exists():
+                    try:
+                        a_key = json.loads(a_key_file.read_text(encoding="utf-8"))
+                    except Exception:
+                        a_key = {}
+                    a_sol = a_key.get("solution_md", "")
+                    a_conf = a_key.get("confidence", "low").lower()
+                    a_len = len(a_sol)
+
+                    reasons = []
+                    if b_len < a_len:
+                        reasons.append("shorter_solution")
+                    if conf_rank.get(b_conf, 1) > conf_rank.get(a_conf, 1):
+                        reasons.append("higher_confidence")
+
+                    fam_flagged = len(reasons) > 0
+                    if fam_flagged:
+                        item_flagged = True
+
+                    family_flags[family] = {
+                        "flagged": fam_flagged,
+                        "reasons": reasons,
+                        "b_chars": b_len,
+                        "a_chars": a_len,
+                        "b_confidence": b_conf,
+                        "a_confidence": a_conf
+                    }
+                else:
+                    item_flagged = True
+                    family_flags[family] = {
+                        "flagged": True,
+                        "reasons": ["missing_anchor_key"],
+                        "b_chars": b_len
+                    }
+            else:
+                family_flags[family] = {
+                    "flagged": False,
+                    "reasons": ["no_b_key"]
+                }
+
+        if item_flagged:
+            flagged_ids.append(item_id)
+        else:
+            passed_ids.append(item_id)
+
+        results[item_id] = {
+            "anchor_item": anchor_id,
+            "flagged": item_flagged,
+            "flags": family_flags
+        }
+
+    report = {
+        "chapter": ch_num,
+        "summary": {
+            "total_b_items": len(b_items),
+            "flagged_items": len(flagged_ids),
+            "passed_items": len(passed_ids)
+        },
+        "flagged_item_ids": flagged_ids,
+        "passed_item_ids": passed_ids,
+        "items": results
+    }
+
+    ch_dir.mkdir(parents=True, exist_ok=True)
+    out_file = ch_dir / "difficulty.json"
+    out_file.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Bucket B Selection & Concept Coverage
+# ---------------------------------------------------------------------------
+
+def select_b_chapter(
+    chapter: Any,
+    target: int = 5,
+    data_dir: Path = Path("data"),
+    exit_on_failure: bool = False
+) -> Dict[str, Any]:
+    """
+    Filters to usable, non-flagged B items.
+    First covers every concept with at least one B item (if candidate exists),
+    fills up to target, balancing author families.
+    Writes selection_b.json.
+    Exits non-zero if <5 selected or any concept with usable candidate left uncovered.
+    """
+    ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+    ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}"
+
+    # Load concepts
+    concepts_file = ch_dir / "concepts.json"
+    if not concepts_file.exists():
+        extract_concepts_from_chapter(ch_num, data_dir=data_dir)
+    concepts_data = json.loads(concepts_file.read_text(encoding="utf-8"))
+
+    # Load difficulty report
+    diff_file = ch_dir / "difficulty.json"
+    if diff_file.exists():
+        diff_data = json.loads(diff_file.read_text(encoding="utf-8"))
+    else:
+        diff_data = difficulty_screen_chapter(ch_num, data_dir=data_dir)
+    flagged_ids = set(diff_data.get("flagged_item_ids", []))
+
+    # Load usable items from resolution.json if available
+    res_file = ch_dir / "resolution.json"
+    resolution_usable: Optional[Set[str]] = None
+    if res_file.exists():
+        try:
+            res_json = json.loads(res_file.read_text(encoding="utf-8"))
+            resolution_usable = set(res_json.get("usable_item_ids", []))
+        except Exception:
+            pass
+
+    # Find candidates
+    items_dir = ch_dir / "items"
+    candidate_items: List[Dict[str, Any]] = []
+    if items_dir.exists():
+        for p in sorted(items_dir.glob("*.json")):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if data.get("bucket") != "B" and not p.name.startswith("B_"):
+                continue
+            item_id = data.get("item_id", p.stem)
+            if item_id in flagged_ids:
+                continue
+            if resolution_usable is not None and item_id in resolution_usable:
+                candidate_items.append(data)
+            elif resolution_usable is None and data.get("status") not in {"excluded", "disputed"}:
+                candidate_items.append(data)
+
+    selected_items: List[str] = []
+    selected_ids: Set[str] = set()
+    family_counts: Dict[str, int] = {"claude": 0, "gemini": 0}
+    covered_concepts: Set[str] = set()
+
+    # Step 1: Cover every concept with at least one B item (if candidate exists)
+    for c in concepts_data:
+        cid = c["concept_id"]
+        if cid not in covered_concepts:
+            available = [it for it in candidate_items if cid in it.get("concepts", []) and it["item_id"] not in selected_ids]
+            if available:
+                def sort_key(it):
+                    fam = it.get("author_family", "")
+                    fam_c = family_counts.get(fam, 0)
+                    additional_c = sum(1 for tag in it.get("concepts", []) if tag not in covered_concepts)
+                    return (fam_c, -additional_c, it["item_id"])
+
+                available.sort(key=sort_key)
+                chosen = available[0]
+                selected_items.append(chosen["item_id"])
+                selected_ids.add(chosen["item_id"])
+                fam = chosen.get("author_family", "unknown")
+                family_counts[fam] = family_counts.get(fam, 0) + 1
+                for tag in chosen.get("concepts", []):
+                    covered_concepts.add(tag)
+
+    # Step 2: Check concept coverage completeness
+    uncovered_with_candidate: List[str] = []
+    for c in concepts_data:
+        cid = c["concept_id"]
+        if cid not in covered_concepts:
+            has_cand = any(cid in it.get("concepts", []) for it in candidate_items)
+            if has_cand:
+                uncovered_with_candidate.append(cid)
+
+    # Step 3: Fill up to target, balancing author families
+    remaining = [it for it in candidate_items if it["item_id"] not in selected_ids]
+    while len(selected_items) < target and remaining:
+        def rem_sort_key(it):
+            fam = it.get("author_family", "")
+            return (family_counts.get(fam, 0), it["item_id"])
+        remaining.sort(key=rem_sort_key)
+        chosen = remaining.pop(0)
+        selected_items.append(chosen["item_id"])
+        selected_ids.add(chosen["item_id"])
+        fam = chosen.get("author_family", "unknown")
+        family_counts[fam] = family_counts.get(fam, 0) + 1
+        for tag in chosen.get("concepts", []):
+            covered_concepts.add(tag)
+
+    success = (len(selected_items) >= 5) and (len(uncovered_with_candidate) == 0)
+
+    result = {
+        "chapter": ch_num,
+        "target": target,
+        "selected_count": len(selected_items),
+        "selected_items": selected_items,
+        "family_counts": family_counts,
+        "covered_concepts": sorted(list(covered_concepts)),
+        "uncovered_with_candidate": uncovered_with_candidate,
+        "success": success
+    }
+
+    ch_dir.mkdir(parents=True, exist_ok=True)
+    out_file = ch_dir / "selection_b.json"
+    out_file.write_text(json.dumps(result, indent=2), encoding="utf-8")
+
+    if exit_on_failure and not success:
+        sys.exit(1)
+
+    return result
+
+
+def check_coverage_chapter(
+    chapter: Any,
+    data_dir: Path = Path("data"),
+    exit_on_failure: bool = False
+) -> Dict[str, Any]:
+    """
+    Per concept, counts usable A items and selected B items.
+    Exits non-zero if any concept has 0 selected B while a usable B candidate exists.
+    """
+    ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+    ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}"
+
+    # Load concepts
+    concepts_file = ch_dir / "concepts.json"
+    if not concepts_file.exists():
+        extract_concepts_from_chapter(ch_num, data_dir=data_dir)
+    concepts_data = json.loads(concepts_file.read_text(encoding="utf-8"))
+
+    # Load selection_b
+    selection_file = ch_dir / "selection_b.json"
+    if selection_file.exists():
+        selection_data = json.loads(selection_file.read_text(encoding="utf-8"))
+    else:
+        selection_data = select_b_chapter(ch_num, data_dir=data_dir)
+    selected_b_ids = set(selection_data.get("selected_items", []))
+
+    # Load usable A items from resolution.json or items
+    res_file = ch_dir / "resolution.json"
+    usable_a_ids: Set[str] = set()
+    if res_file.exists():
+        try:
+            res_json = json.loads(res_file.read_text(encoding="utf-8"))
+            usable_a_ids = set(res_json.get("usable_item_ids", []))
+        except Exception:
+            pass
+
+    # Load items
+    items_dir = ch_dir / "items"
+    items_by_id: Dict[str, Dict[str, Any]] = {}
+    if items_dir.exists():
+        for p in sorted(items_dir.glob("*.json")):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                items_by_id[data.get("item_id", p.stem)] = data
+            except Exception:
+                continue
+
+    if not usable_a_ids:
+        usable_a_ids = {iid for iid, it in items_by_id.items() if it.get("bucket") == "A" and it.get("status") not in {"excluded", "disputed"}}
+
+    # Usable non-flagged B candidates
+    diff_file = ch_dir / "difficulty.json"
+    flagged_ids = set()
+    if diff_file.exists():
+        diff_data = json.loads(diff_file.read_text(encoding="utf-8"))
+        flagged_ids = set(diff_data.get("flagged_item_ids", []))
+
+    usable_b_cand_ids = {
+        iid for iid, it in items_by_id.items()
+        if (it.get("bucket") == "B" or iid.startswith("B_"))
+        and iid not in flagged_ids
+        and it.get("status") not in {"excluded", "disputed"}
+    }
+
+    concept_stats = []
+    uncovered_with_candidate: List[str] = []
+
+    for c in concepts_data:
+        cid = c["concept_id"]
+        title = c["title"]
+
+        usable_a_count = sum(1 for iid in usable_a_ids if cid in items_by_id.get(iid, {}).get("concepts", []))
+        selected_b_count = sum(1 for iid in selected_b_ids if cid in items_by_id.get(iid, {}).get("concepts", []))
+        usable_b_cand_count = sum(1 for iid in usable_b_cand_ids if cid in items_by_id.get(iid, {}).get("concepts", []))
+
+        if selected_b_count == 0 and usable_b_cand_count > 0:
+            uncovered_with_candidate.append(cid)
+
+        concept_stats.append({
+            "concept_id": cid,
+            "title": title,
+            "usable_a_count": usable_a_count,
+            "selected_b_count": selected_b_count,
+            "usable_b_candidate_count": usable_b_cand_count
+        })
+
+    success = (len(uncovered_with_candidate) == 0)
+
+    report = {
+        "chapter": ch_num,
+        "concepts": concept_stats,
+        "uncovered_with_candidate": uncovered_with_candidate,
+        "success": success
+    }
+
+    out_file = ch_dir / "coverage.json"
+    out_file.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    if exit_on_failure and not success:
+        sys.exit(1)
+
+    return report
+
+
+# ---------------------------------------------------------------------------
 # Report Command
 # ---------------------------------------------------------------------------
 
@@ -1484,10 +2095,12 @@ def generate_report(
     """
     Produces report containing COUNTS ONLY.
     - Items by bucket and status
+    - Bucket B items by status and difficulty screen flags
+    - Family review agreement rate and WEAK-REVIEW warning
+    - Per-concept coverage counts
     - How many need a figure
     - How many keys exist per family
     - Parse warnings by item ID
-    If compare_slots.json exists, displays slot-based statuses and slot counts by kind.
     Strictly NO problem statements or keys.
     """
     ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
@@ -1497,18 +2110,23 @@ def generate_report(
     total_items = 0
     buckets: Dict[str, int] = {}
     statuses: Dict[str, int] = {}
+    b_statuses: Dict[str, int] = {}
     needs_figure_count = 0
     parse_warnings: List[str] = []
+    all_items_list: List[Dict[str, Any]] = []
 
     if items_dir.exists():
         for p in sorted(items_dir.glob("*.json")):
             try:
                 data = json.loads(p.read_text(encoding="utf-8"))
+                all_items_list.append(data)
                 total_items += 1
                 b = data.get("bucket", "unknown")
                 buckets[b] = buckets.get(b, 0) + 1
                 s = data.get("status", "unknown")
                 statuses[s] = statuses.get(s, 0) + 1
+                if b == "B" or p.name.startswith("B_"):
+                    b_statuses[s] = b_statuses.get(s, 0) + 1
                 if data.get("needs_figure", False):
                     needs_figure_count += 1
                 if not data.get("statement_md"):
@@ -1584,6 +2202,28 @@ def generate_report(
         else:
             lines.append("  (none)")
 
+    # Bucket B items by status
+    lines.append("")
+    lines.append("Bucket B items by status:")
+    if b_statuses:
+        for s in sorted(b_statuses.keys()):
+            lines.append(f"  {s}: {b_statuses[s]}")
+    else:
+        lines.append("  (none)")
+
+    # Difficulty screen
+    diff_file = ch_dir / "difficulty.json"
+    if diff_file.exists():
+        try:
+            diff_data = json.loads(diff_file.read_text(encoding="utf-8"))
+            s_diff = diff_data.get("summary", {})
+            lines.append("")
+            lines.append("Bucket B difficulty screen:")
+            lines.append(f"  flagged: {s_diff.get('flagged_items', 0)}")
+            lines.append(f"  passed: {s_diff.get('passed_items', 0)}")
+        except Exception:
+            pass
+
     if res_rep and "summary" in res_rep:
         lines.append("")
         lines.append("Items by usability:")
@@ -1595,6 +2235,59 @@ def generate_report(
         for ot in ["agreed", "verified", "resolved_by_concession", "disputed"]:
             if ot in outcomes:
                 lines.append(f"  {ot}: {outcomes[ot]}")
+
+    # Family review agreement rate
+    reviews_dir = ch_dir / "reviews"
+    total_rev = 0
+    equiv_rev = 0
+    if reviews_dir.exists():
+        for rev_file in sorted(reviews_dir.glob("*.json")):
+            try:
+                rev_list = json.loads(rev_file.read_text(encoding="utf-8"))
+                for entry in rev_list:
+                    total_rev += 1
+                    if entry.get("verdict") == "equivalent":
+                        equiv_rev += 1
+            except Exception:
+                pass
+    if total_rev > 0:
+        agreement_rate = equiv_rev / total_rev
+        lines.append("")
+        lines.append("Family review agreement:")
+        lines.append(f"  total reviews: {total_rev}")
+        lines.append(f"  equivalent: {equiv_rev}")
+        lines.append(f"  agreement rate: {agreement_rate:.1%}")
+        if agreement_rate > 0.95:
+            lines.append(f"  WARNING: WEAK-REVIEW (agreement rate {agreement_rate:.1%} > 0.95)")
+
+    # Per-concept coverage counts
+    concepts_file = ch_dir / "concepts.json"
+    if concepts_file.exists():
+        try:
+            concepts_list = json.loads(concepts_file.read_text(encoding="utf-8"))
+            sel_b_set: Set[str] = set()
+            sel_file = ch_dir / "selection_b.json"
+            if sel_file.exists():
+                try:
+                    sel_b_set = set(json.loads(sel_file.read_text(encoding="utf-8")).get("selected_items", []))
+                except Exception:
+                    pass
+            usable_a_set: Set[str] = set()
+            if res_rep:
+                usable_a_set = set(res_rep.get("usable_item_ids", []))
+            elif all_items_list:
+                usable_a_set = {it.get("item_id") for it in all_items_list if it.get("bucket") == "A" and it.get("status") not in {"excluded", "disputed"}}
+
+            lines.append("")
+            lines.append("Concept coverage:")
+            for c in concepts_list:
+                cid = c["concept_id"]
+                ctitle = c["title"]
+                a_count = sum(1 for it in all_items_list if it.get("item_id") in usable_a_set and cid in it.get("concepts", []))
+                b_count = sum(1 for it in all_items_list if it.get("item_id") in sel_b_set and cid in it.get("concepts", []))
+                lines.append(f"  {cid} ({ctitle}): A={a_count}, B={b_count}")
+        except Exception:
+            pass
 
     lines.append("")
     lines.append(f"Items requiring figure: {needs_figure_count}")
@@ -1722,6 +2415,32 @@ def main():
     p_res.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
     p_res.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
 
+    # concepts
+    p_concepts = subparsers.add_parser("concepts", help="Extract major concepts from chapter headings")
+    p_concepts.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
+    p_concepts.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
+
+    # validate-item
+    p_valitem = subparsers.add_parser("validate-item", help="Validate an item JSON file against schema")
+    p_valitem.add_argument("item_file", type=Path, help="Path to item JSON file")
+    p_valitem.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
+
+    # difficulty-screen
+    p_diff = subparsers.add_parser("difficulty-screen", help="Screen Bucket B items for difficulty vs anchor")
+    p_diff.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
+    p_diff.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
+
+    # select-b
+    p_selb = subparsers.add_parser("select-b", help="Select Bucket B items covering concepts and balancing families")
+    p_selb.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
+    p_selb.add_argument("--target", type=int, default=5, help="Target number of B items")
+    p_selb.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
+
+    # coverage
+    p_cov = subparsers.add_parser("coverage", help="Check concept coverage for A and B items")
+    p_cov.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
+    p_cov.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
+
     args = parser.parse_args()
 
     if args.subcommand == "extract-a":
@@ -1801,6 +2520,47 @@ def main():
             f"usable={s['usable_items']}, excluded={s['excluded_items']}. "
             f"Slot outcomes: {rep['slot_outcomes']}"
         ))
+
+    elif args.subcommand == "concepts":
+        concepts = extract_concepts_from_chapter(args.chapter, data_dir=args.data_dir)
+        print(guard_output(f"concepts: extracted {len(concepts)} concepts for Chapter {args.chapter}"))
+        for c in concepts:
+            print(guard_output(f"  {c['concept_id']}: {c['title']}"))
+
+    elif args.subcommand == "validate-item":
+        valid, errors = validate_item_file(args.item_file, data_dir=args.data_dir)
+        if valid:
+            print(guard_output(f"VALID: {args.item_file.name}"))
+            sys.exit(0)
+        else:
+            print(guard_output(f"INVALID: {args.item_file.name} - Errors: {errors}"))
+            sys.exit(1)
+
+    elif args.subcommand == "difficulty-screen":
+        rep = difficulty_screen_chapter(args.chapter, data_dir=args.data_dir)
+        s = rep["summary"]
+        print(guard_output(
+            f"difficulty-screen: total={s['total_b_items']}, flagged={s['flagged_items']}, passed={s['passed_items']}"
+        ))
+
+    elif args.subcommand == "select-b":
+        res = select_b_chapter(args.chapter, target=args.target, data_dir=args.data_dir)
+        print(guard_output(
+            f"select-b: selected {res['selected_count']}/{res['target']} items. "
+            f"claude={res['family_counts'].get('claude', 0)}, gemini={res['family_counts'].get('gemini', 0)}. "
+            f"uncovered_with_candidate={res['uncovered_with_candidate']}"
+        ))
+        if not res["success"]:
+            sys.exit(1)
+
+    elif args.subcommand == "coverage":
+        rep = check_coverage_chapter(args.chapter, data_dir=args.data_dir)
+        print(guard_output(f"coverage: {len(rep['concepts'])} concepts checked"))
+        for c in rep["concepts"]:
+            print(guard_output(f"  {c['concept_id']} ({c['title']}): usable_A={c['usable_a_count']}, selected_B={c['selected_b_count']}"))
+        if not rep["success"]:
+            print(guard_output(f"coverage failure: uncovered concepts with candidates: {rep['uncovered_with_candidate']}"))
+            sys.exit(1)
 
 
 if __name__ == "__main__":

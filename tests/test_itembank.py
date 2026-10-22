@@ -33,7 +33,14 @@ from learn_assist.itembank import (
     validate_slotted_key_file,
     compare_chapter_slots,
     generate_review_queue,
-    resolve_chapter
+    resolve_chapter,
+    extract_concepts_from_chapter,
+    check_statement_option_lists,
+    validate_item,
+    validate_item_file,
+    difficulty_screen_chapter,
+    select_b_chapter,
+    check_coverage_chapter
 )
 
 
@@ -1026,3 +1033,389 @@ def test_review_queue_and_resolve_rules(tmp_path: Path):
     assert "verified: 1" in rep_text
     assert "resolved_by_concession: 2" in rep_text
     assert "disputed: 5" in rep_text
+
+
+# ---------------------------------------------------------------------------
+# Bucket B and Concept Tooling Tests
+# ---------------------------------------------------------------------------
+
+def test_extract_concepts_synthetic(tmp_path: Path):
+    """
+    Tests concept extraction from lowest-level numbered sections:
+    - 1.x.y lowest level
+    - 1.x if no subsections
+    - ignores sub-subsections like 1.x.y.z
+    """
+    data_dir = tmp_path / "data"
+    ch_dir = data_dir / "chapters"
+    ch_dir.mkdir(parents=True)
+
+    fake_text = """# Chapter 1 Synthetic Physics
+## Section 1.1 Spin Systems
+### 1.1.1 Magnetic Moments
+Text for 1.1.1.
+### 1.1.2 Magnetization Vectors
+Text for 1.1.2.
+## 1.2 Isolated Phenomena
+Text for 1.2 without subsections.
+## 1.3 Detection Methods
+### 1.3.1 Induction Coils
+Text for 1.3.1.
+### 1.3.1.1 Coil Geometry
+Sub-sub section that should not be a concept.
+"""
+    (ch_dir / "chapter_01.md").write_text(fake_text, encoding="utf-8")
+
+    concepts = extract_concepts_from_chapter(1, data_dir=data_dir)
+    assert len(concepts) == 4
+    assert [c["concept_id"] for c in concepts] == ["1.1.1", "1.1.2", "1.2", "1.3.1"]
+    assert concepts[0]["title"] == "Magnetic Moments"
+    assert concepts[1]["title"] == "Magnetization Vectors"
+    assert concepts[2]["title"] == "Isolated Phenomena"
+    assert concepts[3]["title"] == "Induction Coils"
+
+    concepts_json = data_dir / "itembank" / "ch01" / "concepts.json"
+    assert concepts_json.exists()
+    saved = json.loads(concepts_json.read_text(encoding="utf-8"))
+    assert saved == concepts
+
+
+def test_b_item_criteria_validation():
+    """
+    Tests Bucket B criteria validation:
+    - >= 2 distinct criteria from 1..6 pass
+    - 1 criterion fails
+    - duplicate criteria (<2 distinct) fail
+    - out of range criterion fails
+    - non-integer criterion fails
+    - missing or empty justification fails
+    """
+    valid_item = {
+        "item_id": "B_claude_01",
+        "bucket": "B",
+        "author_family": "claude",
+        "author_model_id": "claude-3-7-sonnet",
+        "statement_md": "Calculate the precession frequency of a spin system.",
+        "anchor_item": "A_1.01",
+        "criteria": [1, 3],
+        "criteria_justification": {
+            "1": "Tests transfer to a new field geometry.",
+            "3": "Requires calculation of net precession."
+        },
+        "concepts": ["1.1.1"],
+        "status": "drafted"
+    }
+
+    # Pass
+    ok, errors = validate_item(valid_item, usable_anchors={"A_1.01"}, concepts=["1.1.1"])
+    assert ok, f"Expected pass, got errors: {errors}"
+
+    # Only 1 criterion
+    bad_one = dict(valid_item, criteria=[1], criteria_justification={"1": "Only one"})
+    ok, errors = validate_item(bad_one, usable_anchors={"A_1.01"}, concepts=["1.1.1"])
+    assert not ok
+    assert any("at least 2 distinct criteria" in e for e in errors)
+
+    # Duplicate criteria
+    bad_dup = dict(valid_item, criteria=[2, 2], criteria_justification={"2": "Dup"})
+    ok, errors = validate_item(bad_dup, usable_anchors={"A_1.01"}, concepts=["1.1.1"])
+    assert not ok
+    assert any("at least 2 distinct criteria" in e for e in errors)
+
+    # Out of range (7)
+    bad_range = dict(valid_item, criteria=[1, 7], criteria_justification={"1": "A", "7": "B"})
+    ok, errors = validate_item(bad_range, usable_anchors={"A_1.01"}, concepts=["1.1.1"])
+    assert not ok
+    assert any("Invalid criterion 7" in e for e in errors)
+
+    # Non-integer criterion
+    bad_type = dict(valid_item, criteria=["1", "2"])
+    ok, errors = validate_item(bad_type, usable_anchors={"A_1.01"}, concepts=["1.1.1"])
+    assert not ok
+    assert any("must be integer in 1..6" in e for e in errors)
+
+    # Missing justification
+    bad_just = dict(valid_item, criteria=[1, 2], criteria_justification={"1": "Only 1"})
+    ok, errors = validate_item(bad_just, usable_anchors={"A_1.01"}, concepts=["1.1.1"])
+    assert not ok
+    assert any("Missing or empty criteria_justification for criterion 2" in e for e in errors)
+
+
+def test_unknown_concept_fails():
+    """
+    Tests that any unknown concept ID in concepts tag fails validation.
+    """
+    valid_concepts = ["1.1.1", "1.1.2"]
+
+    # Bucket B item with unknown concept
+    item_b = {
+        "item_id": "B_gemini_01",
+        "bucket": "B",
+        "author_family": "gemini",
+        "author_model_id": "gemini-2.5-pro",
+        "statement_md": "Calculate relaxation time.",
+        "anchor_item": "A_1.01",
+        "criteria": [1, 2],
+        "criteria_justification": {"1": "reason 1", "2": "reason 2"},
+        "concepts": ["1.1.1", "9.9.9"],
+        "status": "drafted"
+    }
+    ok, errors = validate_item(item_b, usable_anchors={"A_1.01"}, concepts=valid_concepts)
+    assert not ok
+    assert any("Unknown concept ID: 9.9.9" in e for e in errors)
+
+    # Bucket A item with unknown concept
+    item_a = {
+        "item_id": "A_1.01",
+        "bucket": "A",
+        "concepts": ["9.9.9"]
+    }
+    ok, errors = validate_item(item_a, concepts=valid_concepts)
+    assert not ok
+    assert any("Unknown concept ID: 9.9.9" in e for e in errors)
+
+    # Bucket B empty concepts list fails
+    item_b_empty = dict(item_b, concepts=[])
+    ok, errors = validate_item(item_b_empty, usable_anchors={"A_1.01"}, concepts=valid_concepts)
+    assert not ok
+    assert any("non-empty list" in e for e in errors)
+
+
+def test_non_usable_anchor_fails():
+    """
+    Tests that a Bucket B item referencing a non-usable anchor item fails validation.
+    """
+    item_b = {
+        "item_id": "B_claude_01",
+        "bucket": "B",
+        "author_family": "claude",
+        "author_model_id": "claude-3-7-sonnet",
+        "statement_md": "Determine magnetic field.",
+        "anchor_item": "A_1.99",
+        "criteria": [1, 2],
+        "criteria_justification": {"1": "reason 1", "2": "reason 2"},
+        "concepts": ["1.1.1"],
+        "status": "drafted"
+    }
+
+    # Anchor not in usable_anchors
+    ok, errors = validate_item(item_b, usable_anchors={"A_1.01", "A_1.02"}, concepts=["1.1.1"])
+    assert not ok
+    assert any("not a usable Bucket A item in resolution.json" in e for e in errors)
+
+    # Anchor not starting with A_
+    bad_prefix = dict(item_b, anchor_item="B_gemini_01")
+    ok, errors = validate_item(bad_prefix, usable_anchors={"A_1.01"}, concepts=["1.1.1"])
+    assert not ok
+    assert any("must be a Bucket A item" in e for e in errors)
+
+
+def test_option_list_detection():
+    """
+    Tests detection of option lists in statement_md:
+    - which of the following
+    - (A)...(B)...
+    - (a)...(b)...
+    """
+    assert check_statement_option_lists("Which of the following describes Larmor precession?")
+    assert check_statement_option_lists("Calculate B1: (A) 10 uT (B) 20 uT (C) 30 uT")
+    assert check_statement_option_lists("Calculate B1:\n(a) 10 uT\n(b) 20 uT")
+    assert not check_statement_option_lists("A spin-1/2 particle is in a 1.5 T field. Find the precession frequency.")
+
+    # Validation integration
+    item = {
+        "item_id": "B_claude_01",
+        "bucket": "B",
+        "author_family": "claude",
+        "author_model_id": "claude-3-7-sonnet",
+        "statement_md": "Which of the following is correct regarding T1 relaxation?",
+        "anchor_item": "A_1.01",
+        "criteria": [1, 2],
+        "criteria_justification": {"1": "r1", "2": "r2"},
+        "concepts": ["1.1.1"],
+        "status": "drafted"
+    }
+    ok, errors = validate_item(item, usable_anchors={"A_1.01"}, concepts=["1.1.1"])
+    assert not ok
+    assert any("option list or 'which of the following'" in e for e in errors)
+
+
+def test_difficulty_screen_flags(tmp_path: Path):
+    """
+    Tests difficulty screen rules:
+    - shorter solution_md in chars -> flagged
+    - higher confidence (low < medium < high) -> flagged
+    - longer solution_md and equal/lower confidence -> passes
+    - flagged if EITHER family flags it
+    """
+    data_dir = tmp_path / "data"
+    ch_dir = data_dir / "itembank" / "ch01"
+    items_dir = ch_dir / "items"
+    keys_c = ch_dir / "keys" / "claude"
+    keys_g = ch_dir / "keys" / "gemini"
+    items_dir.mkdir(parents=True)
+    keys_c.mkdir(parents=True)
+    keys_g.mkdir(parents=True)
+
+    # Base anchor A key: length 200, confidence "medium"
+    a_key_c = {"solution_md": "X" * 200, "confidence": "medium"}
+    a_key_g = {"solution_md": "Y" * 200, "confidence": "medium"}
+    (keys_c / "A_1.01.json").write_text(json.dumps(a_key_c), encoding="utf-8")
+    (keys_g / "A_1.01.json").write_text(json.dumps(a_key_g), encoding="utf-8")
+
+    # Item 1: shorter solution (100 chars < 200) -> flagged by claude
+    (items_dir / "B_claude_01.json").write_text(json.dumps({
+        "item_id": "B_claude_01", "bucket": "B", "anchor_item": "A_1.01"
+    }), encoding="utf-8")
+    (keys_c / "B_claude_01.json").write_text(json.dumps({
+        "solution_md": "S" * 100, "confidence": "medium"
+    }), encoding="utf-8")
+    (keys_g / "B_claude_01.json").write_text(json.dumps({
+        "solution_md": "S" * 250, "confidence": "medium"
+    }), encoding="utf-8")
+
+    # Item 2: higher confidence ("high" > "medium") -> flagged by claude
+    (items_dir / "B_claude_02.json").write_text(json.dumps({
+        "item_id": "B_claude_02", "bucket": "B", "anchor_item": "A_1.01"
+    }), encoding="utf-8")
+    (keys_c / "B_claude_02.json").write_text(json.dumps({
+        "solution_md": "S" * 250, "confidence": "high"
+    }), encoding="utf-8")
+    (keys_g / "B_claude_02.json").write_text(json.dumps({
+        "solution_md": "S" * 250, "confidence": "medium"
+    }), encoding="utf-8")
+
+    # Item 3: longer solution and lower confidence ("low" < "medium") -> PASSES
+    (items_dir / "B_claude_03.json").write_text(json.dumps({
+        "item_id": "B_claude_03", "bucket": "B", "anchor_item": "A_1.01"
+    }), encoding="utf-8")
+    (keys_c / "B_claude_03.json").write_text(json.dumps({
+        "solution_md": "S" * 250, "confidence": "low"
+    }), encoding="utf-8")
+    (keys_g / "B_claude_03.json").write_text(json.dumps({
+        "solution_md": "S" * 250, "confidence": "medium"
+    }), encoding="utf-8")
+
+    # Item 4: longer solution and equal confidence ("medium" == "medium") -> PASSES
+    (items_dir / "B_gemini_01.json").write_text(json.dumps({
+        "item_id": "B_gemini_01", "bucket": "B", "anchor_item": "A_1.01"
+    }), encoding="utf-8")
+    (keys_c / "B_gemini_01.json").write_text(json.dumps({
+        "solution_md": "S" * 250, "confidence": "medium"
+    }), encoding="utf-8")
+    (keys_g / "B_gemini_01.json").write_text(json.dumps({
+        "solution_md": "S" * 250, "confidence": "medium"
+    }), encoding="utf-8")
+
+    rep = difficulty_screen_chapter(1, data_dir=data_dir)
+    assert (ch_dir / "difficulty.json").exists()
+    assert set(rep["flagged_item_ids"]) == {"B_claude_01", "B_claude_02"}
+    assert set(rep["passed_item_ids"]) == {"B_claude_03", "B_gemini_01"}
+    assert rep["summary"]["flagged_items"] == 2
+    assert rep["summary"]["passed_items"] == 2
+
+
+def test_select_b_coverage_and_threshold(tmp_path: Path):
+    """
+    Tests select-b:
+    - Prioritizes covering every concept with at least one B item
+    - Balances author families
+    - Exits non-zero if <5 items selected
+    """
+    data_dir = tmp_path / "data"
+    ch_dir = data_dir / "itembank" / "ch01"
+    items_dir = ch_dir / "items"
+    items_dir.mkdir(parents=True)
+
+    concepts_data = [
+        {"concept_id": "1.1.1", "title": "Concept 1"},
+        {"concept_id": "1.1.2", "title": "Concept 2"},
+        {"concept_id": "1.1.3", "title": "Concept 3"}
+    ]
+    (ch_dir / "concepts.json").write_text(json.dumps(concepts_data), encoding="utf-8")
+
+    # Empty difficulty.json so no items flagged
+    (ch_dir / "difficulty.json").write_text(json.dumps({"flagged_item_ids": []}), encoding="utf-8")
+
+    # Subcase 1: Only 4 candidate items -> fails threshold (<5)
+    for i in range(1, 5):
+        (items_dir / f"B_claude_0{i}.json").write_text(json.dumps({
+            "item_id": f"B_claude_0{i}",
+            "bucket": "B",
+            "author_family": "claude",
+            "concepts": ["1.1.1"],
+            "status": "usable"
+        }), encoding="utf-8")
+
+    res = select_b_chapter(1, target=5, data_dir=data_dir)
+    assert res["selected_count"] == 4
+    assert res["success"] is False
+    with pytest.raises(SystemExit):
+        select_b_chapter(1, target=5, data_dir=data_dir, exit_on_failure=True)
+
+    # Subcase 2: Add more candidate items covering all concepts across families
+    # Add Gemini and Claude items
+    items_to_create = [
+        ("B_claude_01", "claude", ["1.1.1"]),
+        ("B_gemini_01", "gemini", ["1.1.2"]),
+        ("B_claude_02", "claude", ["1.1.3"]),
+        ("B_gemini_02", "gemini", ["1.1.1"]),
+        ("B_claude_03", "claude", ["1.1.2"]),
+        ("B_gemini_03", "gemini", ["1.1.3"])
+    ]
+    for iid, fam, tags in items_to_create:
+        (items_dir / f"{iid}.json").write_text(json.dumps({
+            "item_id": iid,
+            "bucket": "B",
+            "author_family": fam,
+            "concepts": tags,
+            "status": "usable"
+        }), encoding="utf-8")
+
+    res2 = select_b_chapter(1, target=5, data_dir=data_dir)
+    assert res2["selected_count"] == 5
+    assert res2["success"] is True
+    assert set(res2["covered_concepts"]) == {"1.1.1", "1.1.2", "1.1.3"}
+    assert res2["uncovered_with_candidate"] == []
+    # Check balancing: 3 and 2
+    f_counts = res2["family_counts"]
+    assert sorted([f_counts["claude"], f_counts["gemini"]]) == [2, 3]
+
+    # Test check_coverage_chapter
+    cov = check_coverage_chapter(1, data_dir=data_dir)
+    assert cov["success"] is True
+    assert cov["uncovered_with_candidate"] == []
+
+
+def test_weak_review_warning(tmp_path: Path):
+    """
+    Tests that generate_report emits WEAK-REVIEW warning when
+    family review agreement rate > 0.95, and does not when <= 0.95.
+    """
+    data_dir = tmp_path / "data"
+    ch_dir = data_dir / "itembank" / "ch01"
+    rev_dir = ch_dir / "reviews"
+    rev_dir.mkdir(parents=True)
+
+    # Case A: 38 equivalent out of 39 (97.4% > 0.95)
+    revs_c = [{"verdict": "equivalent"}] * 20
+    revs_g = [{"verdict": "equivalent"}] * 18 + [{"verdict": "disputed"}]
+    (rev_dir / "claude.json").write_text(json.dumps(revs_c), encoding="utf-8")
+    (rev_dir / "gemini.json").write_text(json.dumps(revs_g), encoding="utf-8")
+
+    rep_a = generate_report(1, data_dir=data_dir)
+    assert "Family review agreement:" in rep_a
+    assert "WARNING: WEAK-REVIEW" in rep_a
+    assert "97.4%" in rep_a
+
+    # Case B: 8 equivalent out of 10 (80.0% <= 0.95)
+    revs_c2 = [{"verdict": "equivalent"}] * 4 + [{"verdict": "other_wrong"}]
+    revs_g2 = [{"verdict": "equivalent"}] * 4 + [{"verdict": "mine_wrong"}]
+    (rev_dir / "claude.json").write_text(json.dumps(revs_c2), encoding="utf-8")
+    (rev_dir / "gemini.json").write_text(json.dumps(revs_g2), encoding="utf-8")
+
+    rep_b = generate_report(1, data_dir=data_dir)
+    assert "Family review agreement:" in rep_b
+    assert "80.0%" in rep_b
+    assert "WARNING: WEAK-REVIEW" not in rep_b
+
