@@ -1593,8 +1593,20 @@ def generate_review_queue(
     cmp_data = json.loads(cmp_file.read_text(encoding="utf-8"))
     results = cmp_data.get("results", {})
 
+    # Check for already resolved items (e.g. Bucket A items already resolved)
+    res_file = ch_dir / "resolution.json"
+    resolved_item_ids: Set[str] = set()
+    if res_file.exists():
+        try:
+            res_data = json.loads(res_file.read_text(encoding="utf-8"))
+            resolved_item_ids = set(res_data.get("items", {}).keys())
+        except Exception:
+            pass
+
     queue: List[Dict[str, str]] = []
     for item_id in sorted(results.keys()):
+        if item_id in resolved_item_ids:
+            continue
         slots = results[item_id].get("slots", [])
         for s in slots:
             status = s.get("status", "")
@@ -1608,6 +1620,70 @@ def generate_review_queue(
     out_file = ch_dir / "review_queue.json"
     out_file.write_text(json.dumps(queue, indent=2), encoding="utf-8")
     return queue
+
+
+def check_item_solver_flags(
+    item_id: str,
+    chapter: Any,
+    data_dir: Path = Path("data")
+) -> Tuple[bool, Optional[str]]:
+    """
+    Checks if a B item has a solver flag in any non-author key.
+    Returns (is_flagged, reason_or_issue).
+    A B item is flagged if any non-author key has well_posed=false or needs_external_info=true.
+    """
+    ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+    ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}"
+
+    # Determine author family and whether it's a B item
+    item_file = ch_dir / "items" / f"{item_id}.json"
+    author_family = None
+    is_b = item_id.startswith("B_")
+    if item_file.exists():
+        try:
+            idata = json.loads(item_file.read_text(encoding="utf-8"))
+            author_family = idata.get("author_family")
+            if idata.get("bucket") == "B":
+                is_b = True
+        except Exception:
+            pass
+    if not author_family:
+        m = re.match(r'^B_([a-zA-Z0-9]+)_', item_id)
+        if m:
+            author_family = m.group(1).lower()
+
+    if not is_b:
+        return False, None
+
+    if author_family:
+        author_family = author_family.lower()
+
+    keys_dir = ch_dir / "keys"
+    if not keys_dir.exists():
+        return False, None
+
+    for fam_dir in sorted(keys_dir.iterdir()):
+        if not fam_dir.is_dir():
+            continue
+        fam = fam_dir.name.lower()
+        if author_family and fam == author_family:
+            continue
+        key_file = fam_dir / f"{item_id}.json"
+        if not key_file.exists():
+            continue
+        try:
+            kdata = json.loads(key_file.read_text(encoding="utf-8"))
+            solver = kdata.get("solver")
+            if isinstance(solver, dict):
+                well_posed = solver.get("well_posed", True)
+                needs_ext = solver.get("needs_external_info", False)
+                if well_posed is False or needs_ext is True:
+                    issue = solver.get("issue", "")
+                    return True, issue or "solver_flag"
+        except Exception:
+            pass
+
+    return False, None
 
 
 def resolve_chapter(
@@ -1777,16 +1853,32 @@ def resolve_chapter(
             if outcome not in USABLE_SLOT_OUTCOMES:
                 item_is_usable = False
 
-        item_status = "usable" if item_is_usable else "excluded"
-        if item_is_usable:
-            usable_item_ids.append(item_id)
-        else:
+        # Check solver flags for B items
+        is_sf, sf_issue = check_item_solver_flags(item_id, ch_num, data_dir=data_dir)
+        if is_sf:
+            item_status = "excluded_solver_flag"
             excluded_item_ids.append(item_id)
-
-        items_res[item_id] = {
-            "status": item_status,
-            "slots": slot_resolutions
-        }
+            items_res[item_id] = {
+                "status": item_status,
+                "reason": "solver_flag",
+                "issue": sf_issue or "",
+                "slots": slot_resolutions
+            }
+        elif item_is_usable:
+            item_status = "usable"
+            usable_item_ids.append(item_id)
+            items_res[item_id] = {
+                "status": item_status,
+                "slots": slot_resolutions
+            }
+        else:
+            item_status = "excluded"
+            excluded_item_ids.append(item_id)
+            items_res[item_id] = {
+                "status": item_status,
+                "reason": "disputed",
+                "slots": slot_resolutions
+            }
 
     resolution_report = {
         "chapter": ch_num,
@@ -2025,9 +2117,12 @@ def select_b_chapter(
             item_id = data.get("item_id", p.stem)
             if item_id in flagged_ids or item_id in unscreened_ids:
                 continue
+            is_sf, _ = check_item_solver_flags(item_id, ch_num, data_dir=data_dir)
+            if is_sf:
+                continue
             if resolution_usable is not None and item_id in resolution_usable:
                 candidate_items.append(data)
-            elif resolution_usable is None and data.get("status") not in {"excluded", "disputed"}:
+            elif resolution_usable is None and data.get("status") not in {"excluded", "disputed", "excluded_solver_flag"}:
                 candidate_items.append(data)
 
     selected_items: List[str] = []
@@ -2132,10 +2227,15 @@ def check_coverage_chapter(
     # Load usable A items from resolution.json or items
     res_file = ch_dir / "resolution.json"
     usable_a_ids: Set[str] = set()
+    res_usable_all: Optional[Set[str]] = None
     if res_file.exists():
         try:
             res_json = json.loads(res_file.read_text(encoding="utf-8"))
-            usable_a_ids = set(res_json.get("usable_item_ids", []))
+            res_usable_all = set(res_json.get("usable_item_ids", []))
+            usable_a_ids = {
+                iid for iid in res_usable_all
+                if not iid.startswith("B_")
+            }
         except Exception:
             pass
 
@@ -2160,12 +2260,20 @@ def check_coverage_chapter(
         diff_data = json.loads(diff_file.read_text(encoding="utf-8"))
         flagged_ids = set(diff_data.get("flagged_item_ids", []))
 
-    usable_b_cand_ids = {
-        iid for iid, it in items_by_id.items()
-        if (it.get("bucket") == "B" or iid.startswith("B_"))
-        and iid not in flagged_ids
-        and it.get("status") not in {"excluded", "disputed"}
-    }
+    usable_b_cand_ids = set()
+    for iid, it in items_by_id.items():
+        if not (it.get("bucket") == "B" or iid.startswith("B_")):
+            continue
+        if iid in flagged_ids:
+            continue
+        is_sf, _ = check_item_solver_flags(iid, ch_num, data_dir=data_dir)
+        if is_sf:
+            continue
+        if res_usable_all is not None:
+            if iid in res_usable_all:
+                usable_b_cand_ids.add(iid)
+        elif it.get("status") not in {"excluded", "disputed", "excluded_solver_flag"}:
+            usable_b_cand_ids.add(iid)
 
     concept_stats = []
     uncovered_with_candidate: List[str] = []

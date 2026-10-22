@@ -1543,3 +1543,113 @@ def test_difficulty_screen_unscreened(tmp_path: Path):
     assert "B_claude_01" not in rep["flagged_item_ids"]
     assert rep["items"]["B_claude_01"]["status"] == "unscreened"
 
+
+def test_b_solver_flags_unusable(tmp_path: Path):
+    """
+    Tests that a B item is 'excluded_solver_flag' if any non-author key has
+    well_posed=false or needs_external_info=true, and that resolve and select-b
+    treat these items as unusable.
+    """
+    data_dir = tmp_path / "data"
+    ch_dir = data_dir / "itembank" / "ch01"
+    items_dir = ch_dir / "items"
+    slots_dir = ch_dir / "slots"
+    keys_c_dir = ch_dir / "keys" / "claude"
+    keys_g_dir = ch_dir / "keys" / "gemini"
+    slotted_c_dir = ch_dir / "slotted" / "claude"
+    slotted_g_dir = ch_dir / "slotted" / "gemini"
+
+    for d in [items_dir, slots_dir, keys_c_dir, keys_g_dir, slotted_c_dir, slotted_g_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    # Concepts
+    (ch_dir / "concepts.json").write_text(json.dumps([
+        {"concept_id": "1.1", "title": "Concept One"},
+        {"concept_id": "1.2", "title": "Concept Two"}
+    ]), encoding="utf-8")
+
+    # Anchor keys
+    (keys_c_dir / "A_1.01.json").write_text(json.dumps({"solution_md": "Y" * 100, "confidence": "high"}), encoding="utf-8")
+    (keys_g_dir / "A_1.01.json").write_text(json.dumps({"solution_md": "Y" * 100, "confidence": "high"}), encoding="utf-8")
+
+    # Items
+    items = {
+        "B_claude_01": {"author": "claude", "concept": "1.1", "wp": False, "ext": False, "issue": "ambiguous"},
+        "B_claude_02": {"author": "claude", "concept": "1.1", "wp": True, "ext": True, "issue": "needs formula"},
+        "B_gemini_01": {"author": "gemini", "concept": "1.2", "wp": True, "ext": False, "issue": ""},
+        "B_gemini_02": {"author": "gemini", "concept": "1.2", "wp": True, "ext": False, "issue": ""}
+    }
+
+    for iid, info in items.items():
+        (items_dir / f"{iid}.json").write_text(json.dumps({
+            "item_id": iid,
+            "bucket": "B",
+            "author_family": info["author"],
+            "anchor_item": "A_1.01",
+            "concepts": [info["concept"]],
+            "status": "unkeyed"
+        }), encoding="utf-8")
+
+        (slots_dir / f"{iid}.json").write_text(json.dumps({
+            "item_id": iid,
+            "slots": [{"slot_id": "s1", "kind": "numeric", "unit": "m", "asks": "length"}]
+        }), encoding="utf-8")
+
+        # Slotted answers match so slots agree
+        (slotted_c_dir / f"{iid}.json").write_text(json.dumps({
+            "item_id": iid,
+            "model_family": "claude",
+            "answers": {"s1": {"value": 10.0, "unit": "m"}}
+        }), encoding="utf-8")
+        (slotted_g_dir / f"{iid}.json").write_text(json.dumps({
+            "item_id": iid,
+            "model_family": "gemini",
+            "answers": {"s1": {"value": 10.0, "unit": "m"}}
+        }), encoding="utf-8")
+
+        # Keys
+        if info["author"] == "claude":
+            (keys_c_dir / f"{iid}.json").write_text(json.dumps({"solution_md": "Y" * 150, "confidence": "high"}), encoding="utf-8")
+            (keys_g_dir / f"{iid}.json").write_text(json.dumps({
+                "solution_md": "Y" * 150,
+                "confidence": "high",
+                "solver": {"well_posed": info["wp"], "needs_external_info": info["ext"], "issue": info["issue"]}
+            }), encoding="utf-8")
+        else:
+            (keys_g_dir / f"{iid}.json").write_text(json.dumps({"solution_md": "Y" * 150, "confidence": "high"}), encoding="utf-8")
+            (keys_c_dir / f"{iid}.json").write_text(json.dumps({
+                "solution_md": "Y" * 150,
+                "confidence": "high",
+                "solver": {"well_posed": info["wp"], "needs_external_info": info["ext"], "issue": info["issue"]}
+            }), encoding="utf-8")
+
+    # Run compare-slots
+    compare_chapter_slots(1, data_dir=data_dir)
+
+    # Run resolve
+    res_rep = resolve_chapter(1, data_dir=data_dir)
+    assert res_rep["summary"]["usable_items"] == 2
+    assert res_rep["summary"]["excluded_items"] == 2
+    assert set(res_rep["usable_item_ids"]) == {"B_gemini_01", "B_gemini_02"}
+    assert set(res_rep["excluded_item_ids"]) == {"B_claude_01", "B_claude_02"}
+
+    assert res_rep["items"]["B_claude_01"]["status"] == "excluded_solver_flag"
+    assert res_rep["items"]["B_claude_01"]["reason"] == "solver_flag"
+    assert res_rep["items"]["B_claude_02"]["status"] == "excluded_solver_flag"
+    assert res_rep["items"]["B_claude_02"]["reason"] == "solver_flag"
+    assert res_rep["items"]["B_gemini_01"]["status"] == "usable"
+    assert res_rep["items"]["B_gemini_02"]["status"] == "usable"
+
+    # Run select-b
+    sel_res = select_b_chapter(1, target=2, data_dir=data_dir)
+    assert set(sel_res["selected_items"]) == {"B_gemini_01", "B_gemini_02"}
+    assert "B_claude_01" not in sel_res["selected_items"]
+    assert "B_claude_02" not in sel_res["selected_items"]
+
+    # Even if resolution.json is removed, select-b must treat solver-flagged items as unusable
+    (ch_dir / "resolution.json").unlink()
+    sel_res_no_res = select_b_chapter(1, target=2, data_dir=data_dir)
+    assert "B_claude_01" not in sel_res_no_res["selected_items"]
+    assert "B_claude_02" not in sel_res_no_res["selected_items"]
+
+
