@@ -43,7 +43,10 @@ from learn_assist.itembank import (
     check_coverage_chapter,
     merge_tags_chapter,
     update_b_item_statuses,
-    screen_feedback_chapter
+    screen_feedback_chapter,
+    freeze_chapter,
+    verify_frozen_chapter,
+    check_frozen
 )
 
 
@@ -1998,6 +2001,128 @@ def test_screen_feedback(tmp_path: Path):
     assert fb_c[0]["ratio"] == 0.5
     assert fb_c[0]["b_confidence"] == "medium"
     assert fb_c[0]["a_confidence"] == "high"
+
+
+# ---------------------------------------------------------------------------
+# Freezing & Integrity Tests
+# ---------------------------------------------------------------------------
+
+def _setup_synthetic_frozen_env(tmp_path: Path, coverage_success: bool = True) -> Tuple[Path, Path]:
+    data_dir = tmp_path / "data"
+    ch_dir = data_dir / "itembank" / "ch01"
+    for sub in ["items", "slots", "keys/claude", "keys/gemini", "slotted/claude", "slotted/gemini"]:
+        (ch_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    # Resolution
+    res_data = {
+        "chapter": 1,
+        "usable_item_ids": ["A_1.01", "B_gemini_01"],
+        "excluded_item_ids": [],
+        "items": {}
+    }
+    (ch_dir / "resolution.json").write_text(json.dumps(res_data), encoding="utf-8")
+
+    # Difficulty
+    diff_data = {"chapter": 1, "items": []}
+    (ch_dir / "difficulty.json").write_text(json.dumps(diff_data), encoding="utf-8")
+
+    # Selection
+    sel_data = {
+        "chapter": 1,
+        "target": 1,
+        "selected_items": ["B_gemini_01"],
+        "success": True
+    }
+    (ch_dir / "selection_b.json").write_text(json.dumps(sel_data), encoding="utf-8")
+
+    # Coverage
+    cov_data = {
+        "chapter": 1,
+        "success": coverage_success
+    }
+    (ch_dir / "coverage.json").write_text(json.dumps(cov_data), encoding="utf-8")
+
+    # Files for A_1.01 and B_gemini_01
+    for i_id in ["A_1.01", "B_gemini_01"]:
+        (ch_dir / "items" / f"{i_id}.json").write_text(json.dumps({"item_id": i_id}), encoding="utf-8")
+        (ch_dir / "slots" / f"{i_id}.json").write_text(json.dumps({"item_id": i_id, "slots": []}), encoding="utf-8")
+        for fam in ["claude", "gemini"]:
+            (ch_dir / "keys" / fam / f"{i_id}.json").write_text(json.dumps({"item_id": i_id}), encoding="utf-8")
+            (ch_dir / "slotted" / fam / f"{i_id}.json").write_text(json.dumps({"item_id": i_id}), encoding="utf-8")
+
+    return data_dir, ch_dir
+
+
+def test_freeze_refuses_when_coverage_fails(tmp_path: Path):
+    data_dir, ch_dir = _setup_synthetic_frozen_env(tmp_path, coverage_success=False)
+
+    with pytest.raises(RuntimeError, match="coverage did not succeed"):
+        freeze_chapter(1, data_dir=data_dir)
+
+    assert not (ch_dir / "FROZEN.json").exists()
+
+
+def test_write_while_frozen_refused(tmp_path: Path):
+    data_dir, ch_dir = _setup_synthetic_frozen_env(tmp_path, coverage_success=True)
+
+    # Freeze chapter
+    rep = freeze_chapter(1, data_dir=data_dir)
+    assert (ch_dir / "FROZEN.json").exists()
+    assert len(rep["files"]) > 0
+
+    # Attempt write via update_b_item_statuses without unfreeze
+    with pytest.raises(RuntimeError, match="FROZEN"):
+        update_b_item_statuses(1, data_dir=data_dir)
+
+    # Attempt write via merge_tags_chapter without unfreeze
+    with pytest.raises(RuntimeError, match="FROZEN"):
+        merge_tags_chapter(1, data_dir=data_dir)
+
+
+def test_verify_frozen_catches_modified_file(tmp_path: Path):
+    data_dir, ch_dir = _setup_synthetic_frozen_env(tmp_path, coverage_success=True)
+
+    freeze_chapter(1, data_dir=data_dir)
+
+    # Initial verification should succeed
+    ok, rep = verify_frozen_chapter(1, data_dir=data_dir)
+    assert ok is True
+    assert rep["mismatches"] == []
+    assert rep["missing"] == []
+
+    # Tamper with a frozen file
+    item_file = ch_dir / "items" / "A_1.01.json"
+    item_file.write_text(json.dumps({"item_id": "A_1.01", "tampered": True}), encoding="utf-8")
+
+    # Verification should catch the modification
+    ok2, rep2 = verify_frozen_chapter(1, data_dir=data_dir)
+    assert ok2 is False
+    assert "items/A_1.01.json" in rep2["mismatches"]
+
+
+def test_unfreeze_logged(tmp_path: Path):
+    data_dir, ch_dir = _setup_synthetic_frozen_env(tmp_path, coverage_success=True)
+
+    freeze_chapter(1, data_dir=data_dir)
+    assert (ch_dir / "FROZEN.json").exists()
+
+    # Unfreeze with explicit user
+    unfrozen = check_frozen(1, data_dir=data_dir, unfreeze=True, user="synthetic_reviewer")
+    assert unfrozen is True
+    assert not (ch_dir / "FROZEN.json").exists()
+
+    # Check freeze_log.json
+    log_file = ch_dir / "freeze_log.json"
+    assert log_file.exists()
+    log_entries = json.loads(log_file.read_text(encoding="utf-8"))
+    assert len(log_entries) == 1
+    assert log_entries[0]["user"] == "synthetic_reviewer"
+    assert "unfrozen_at" in log_entries[0]
+
+    # Modification should now succeed
+    res = update_b_item_statuses(1, data_dir=data_dir)
+    assert isinstance(res, dict)
+
 
 
 

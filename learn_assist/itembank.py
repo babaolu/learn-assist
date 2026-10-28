@@ -16,6 +16,9 @@ import json
 import math
 import random
 import argparse
+import hashlib
+import getpass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple, Set
 
@@ -131,13 +134,15 @@ def clean_statement_text(raw_text: str) -> str:
 def extract_chapter_a(
     chapter: Any,
     data_dir: Path = Path("data"),
-    output_dir: Optional[Path] = None
+    output_dir: Optional[Path] = None,
+    unfreeze: bool = False
 ) -> Tuple[int, List[str], List[Tuple[str, str]]]:
     """
     Parses the exercise section of the chapter as-printed into Bucket A item files.
     Returns: (items_written_count, item_ids, warnings)
     """
     ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+    check_frozen(ch_num, data_dir=data_dir, unfreeze=unfreeze)
     printed_file = data_dir / "chapters_printed" / f"chapter_{ch_num:02d}.md"
     if not printed_file.exists():
         raise FileNotFoundError(f"Printed chapter file not found: {printed_file}")
@@ -1688,7 +1693,8 @@ def check_item_solver_flags(
 
 def resolve_chapter(
     chapter: Any,
-    data_dir: Path = Path("data")
+    data_dir: Path = Path("data"),
+    unfreeze: bool = False
 ) -> Dict[str, Any]:
     """
     Reads reviews/claude.json and reviews/gemini.json, each a list of
@@ -1897,6 +1903,8 @@ def resolve_chapter(
     out_file = ch_dir / "resolution.json"
     out_file.write_text(json.dumps(resolution_report, indent=2), encoding="utf-8")
 
+    update_b_item_statuses(ch_num, data_dir=data_dir, unfreeze=unfreeze)
+
     return resolution_report
 
 
@@ -1906,7 +1914,8 @@ def resolve_chapter(
 
 def merge_tags_chapter(
     chapter: Any,
-    data_dir: Path = Path("data")
+    data_dir: Path = Path("data"),
+    unfreeze: bool = False
 ) -> Dict[str, Any]:
     """
     For each usable A item, takes the intersection of tags/claude.json and tags/gemini.json;
@@ -1914,6 +1923,7 @@ def merge_tags_chapter(
     Writes the result into each A item's "concepts" field.
     """
     ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+    check_frozen(ch_num, data_dir=data_dir, unfreeze=unfreeze)
     ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}"
     items_dir = ch_dir / "items"
     tags_dir = ch_dir / "tags"
@@ -2000,7 +2010,8 @@ def merge_tags_chapter(
 
 def difficulty_screen_chapter(
     chapter: Any,
-    data_dir: Path = Path("data")
+    data_dir: Path = Path("data"),
+    unfreeze: bool = False
 ) -> Dict[str, Any]:
     """
     For each B item, uses ONLY the non-author family's key to evaluate difficulty
@@ -2164,6 +2175,8 @@ def difficulty_screen_chapter(
     out_file = ch_dir / "difficulty.json"
     out_file.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
+    update_b_item_statuses(ch_num, data_dir=data_dir, unfreeze=unfreeze)
+
     return report
 
 
@@ -2226,7 +2239,8 @@ def select_b_chapter(
     chapter: Any,
     target: int = 5,
     data_dir: Path = Path("data"),
-    exit_on_failure: bool = False
+    exit_on_failure: bool = False,
+    unfreeze: bool = False
 ) -> Dict[str, Any]:
     """
     Filters to usable, non-flagged B items.
@@ -2353,7 +2367,7 @@ def select_b_chapter(
     out_file.write_text(json.dumps(result, indent=2), encoding="utf-8")
 
     # Update each B item's status field after resolve, screen and select
-    update_b_item_statuses(ch_num, data_dir=data_dir)
+    update_b_item_statuses(ch_num, data_dir=data_dir, unfreeze=unfreeze)
 
     if exit_on_failure and not success:
         sys.exit(1)
@@ -2363,7 +2377,8 @@ def select_b_chapter(
 
 def update_b_item_statuses(
     chapter: Any,
-    data_dir: Path = Path("data")
+    data_dir: Path = Path("data"),
+    unfreeze: bool = False
 ) -> Dict[str, str]:
     """
     Updates each B item's status field after resolve, screen and select.
@@ -2375,6 +2390,7 @@ def update_b_item_statuses(
       - disputed
     """
     ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+    check_frozen(ch_num, data_dir=data_dir, unfreeze=unfreeze)
     ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}"
     items_dir = ch_dir / "items"
 
@@ -2886,6 +2902,190 @@ def audit_chapter_symbols(
 
 
 # ---------------------------------------------------------------------------
+# Freezing & Integrity Logic
+# ---------------------------------------------------------------------------
+
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    h.update(path.read_bytes())
+    return h.hexdigest()
+
+
+def check_frozen(
+    chapter: Any,
+    data_dir: Path = Path("data"),
+    unfreeze: bool = False,
+    user: Optional[str] = None
+) -> bool:
+    """
+    Checks if chapter itembank is frozen.
+    If frozen and unfreeze is True:
+      Deletes FROZEN.json, logs unfreeze event to freeze_log.json, returns True.
+    If frozen and unfreeze is False:
+      Raises RuntimeError refusing write.
+    If not frozen:
+      Returns False.
+    """
+    ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+    ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}"
+    frozen_file = ch_dir / "FROZEN.json"
+
+    if not frozen_file.exists():
+        return False
+
+    if unfreeze:
+        frozen_file.unlink()
+        log_file = ch_dir / "freeze_log.json"
+        log_entries = []
+        if log_file.exists():
+            try:
+                log_entries = json.loads(log_file.read_text(encoding="utf-8"))
+                if not isinstance(log_entries, list):
+                    log_entries = []
+            except Exception:
+                log_entries = []
+
+        who = user or os.environ.get("USER")
+        if not who:
+            try:
+                who = getpass.getuser()
+            except Exception:
+                who = "unknown"
+        when = datetime.now(timezone.utc).isoformat()
+        log_entries.append({
+            "unfrozen_at": when,
+            "user": who
+        })
+        log_file.write_text(json.dumps(log_entries, indent=2) + "\n", encoding="utf-8")
+        return True
+    else:
+        raise RuntimeError(f"Itembank for Chapter {ch_num:02d} is FROZEN. Modification refused unless --unfreeze is passed.")
+
+
+def freeze_chapter(
+    chapter: Any,
+    data_dir: Path = Path("data")
+) -> Dict[str, Any]:
+    """
+    Freezes a chapter itembank:
+    Requires resolve, difficulty-screen, select-b and coverage to have run and select-b/coverage to exit 0.
+    Writes data/itembank/chNN/FROZEN.json with:
+      - frozen_at
+      - usable_a_item_ids
+      - selected_b_item_ids
+      - files: dict mapping relative path to sha256
+    """
+    ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+    ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}"
+
+    res_file = ch_dir / "resolution.json"
+    diff_file = ch_dir / "difficulty.json"
+    sel_file = ch_dir / "selection_b.json"
+    if not sel_file.exists():
+        sel_file = ch_dir / "selection.json"
+    cov_file = ch_dir / "coverage.json"
+
+    if not res_file.exists():
+        raise RuntimeError(f"resolve has not run: {res_file.name} missing")
+    if not diff_file.exists():
+        raise RuntimeError(f"difficulty-screen has not run: {diff_file.name} missing")
+    if not sel_file.exists():
+        raise RuntimeError(f"select-b has not run: selection file missing")
+    if not cov_file.exists():
+        raise RuntimeError(f"coverage has not run: {cov_file.name} missing")
+
+    sel_data = json.loads(sel_file.read_text(encoding="utf-8"))
+    if not sel_data.get("success"):
+        raise RuntimeError("select-b did not succeed (exit 0)")
+
+    cov_data = json.loads(cov_file.read_text(encoding="utf-8"))
+    if not cov_data.get("success"):
+        raise RuntimeError("coverage did not succeed (exit 0)")
+
+    res_data = json.loads(res_file.read_text(encoding="utf-8"))
+    usable_a_item_ids = sorted([it for it in res_data.get("usable_item_ids", []) if it.startswith("A_")])
+    selected_b_item_ids = sorted(sel_data.get("selected_items") or sel_data.get("selected_item_ids") or [])
+
+    frozen_items = sorted(list(set(usable_a_item_ids + selected_b_item_ids)))
+
+    files_map: Dict[str, str] = {}
+    for item_id in frozen_items:
+        it_file = ch_dir / "items" / f"{item_id}.json"
+        if not it_file.exists():
+            raise RuntimeError(f"Missing item file: {it_file}")
+        files_map[it_file.relative_to(ch_dir).as_posix()] = file_sha256(it_file)
+
+        sl_file = ch_dir / "slots" / f"{item_id}.json"
+        if not sl_file.exists():
+            raise RuntimeError(f"Missing slot file: {sl_file}")
+        files_map[sl_file.relative_to(ch_dir).as_posix()] = file_sha256(sl_file)
+
+        for fam in ["claude", "gemini"]:
+            kf = ch_dir / "keys" / fam / f"{item_id}.json"
+            if kf.exists():
+                files_map[kf.relative_to(ch_dir).as_posix()] = file_sha256(kf)
+            sf = ch_dir / "slotted" / fam / f"{item_id}.json"
+            if sf.exists():
+                files_map[sf.relative_to(ch_dir).as_posix()] = file_sha256(sf)
+
+    frozen_data = {
+        "chapter": ch_num,
+        "frozen_at": datetime.now(timezone.utc).isoformat(),
+        "usable_a_item_ids": usable_a_item_ids,
+        "selected_b_item_ids": selected_b_item_ids,
+        "files": files_map
+    }
+
+    frozen_file = ch_dir / "FROZEN.json"
+    frozen_file.write_text(json.dumps(frozen_data, indent=2) + "\n", encoding="utf-8")
+    return frozen_data
+
+
+def verify_frozen_chapter(
+    chapter: Any,
+    data_dir: Path = Path("data")
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Verifies the integrity of frozen files against FROZEN.json.
+    Returns (success, report_dict).
+    """
+    ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+    ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}"
+    frozen_file = ch_dir / "FROZEN.json"
+
+    if not frozen_file.exists():
+        return False, {"error": "FROZEN.json does not exist"}
+
+    frozen_data = json.loads(frozen_file.read_text(encoding="utf-8"))
+    files_map = frozen_data.get("files", {})
+
+    mismatches: List[str] = []
+    missing: List[str] = []
+    matched: int = 0
+
+    for rel_path, expected_hash in files_map.items():
+        f = ch_dir / rel_path
+        if not f.exists():
+            missing.append(rel_path)
+        else:
+            actual_hash = file_sha256(f)
+            if actual_hash != expected_hash:
+                mismatches.append(rel_path)
+            else:
+                matched += 1
+
+    success = (len(mismatches) == 0 and len(missing) == 0)
+    return success, {
+        "chapter": ch_num,
+        "total_files": len(files_map),
+        "matched": matched,
+        "mismatches": mismatches,
+        "missing": missing,
+        "success": success
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI Entrypoint & Guard
 # ---------------------------------------------------------------------------
 
@@ -2897,6 +3097,7 @@ def main():
     p_extract = subparsers.add_parser("extract-a", help="Extract Bucket A items from printed chapter")
     p_extract.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
     p_extract.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
+    p_extract.add_argument("--unfreeze", action="store_true", help="Unfreeze itembank if frozen")
 
     # validate-key
     p_val = subparsers.add_parser("validate-key", help="Validate a key JSON file against schema")
@@ -2941,6 +3142,7 @@ def main():
     p_res = subparsers.add_parser("resolve", help="Resolve queued reviews for a chapter")
     p_res.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
     p_res.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
+    p_res.add_argument("--unfreeze", action="store_true", help="Unfreeze itembank if frozen")
 
     # concepts
     p_concepts = subparsers.add_parser("concepts", help="Extract major concepts from chapter headings")
@@ -2957,17 +3159,20 @@ def main():
     p_diff = subparsers.add_parser("difficulty-screen", help="Screen Bucket B items for difficulty vs anchor")
     p_diff.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
     p_diff.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
+    p_diff.add_argument("--unfreeze", action="store_true", help="Unfreeze itembank if frozen")
 
     # select-b
     p_selb = subparsers.add_parser("select-b", help="Select Bucket B items covering concepts and balancing families")
     p_selb.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
     p_selb.add_argument("--target", type=int, default=5, help="Target number of B items")
     p_selb.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
+    p_selb.add_argument("--unfreeze", action="store_true", help="Unfreeze itembank if frozen")
 
     # merge-tags
     p_mergetags = subparsers.add_parser("merge-tags", help="Merge concept tags from claude and gemini for usable A items")
     p_mergetags.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
     p_mergetags.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
+    p_mergetags.add_argument("--unfreeze", action="store_true", help="Unfreeze itembank if frozen")
 
     # screen-feedback
     p_screenfb = subparsers.add_parser("screen-feedback", help="Print feedback on flagged B items for a model family")
@@ -2980,14 +3185,33 @@ def main():
     p_cov.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
     p_cov.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
 
+    # freeze
+    p_freeze = subparsers.add_parser("freeze", help="Freeze itembank for a chapter")
+    p_freeze.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
+    p_freeze.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
+
+    # verify-frozen
+    p_vfreeze = subparsers.add_parser("verify-frozen", help="Verify integrity of frozen itembank")
+    p_vfreeze.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
+    p_vfreeze.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
+
+    # unfreeze
+    p_unfreeze = subparsers.add_parser("unfreeze", help="Unfreeze itembank for a chapter")
+    p_unfreeze.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
+    p_unfreeze.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
+
     args = parser.parse_args()
 
     if args.subcommand == "extract-a":
-        count, ids, warnings = extract_chapter_a(args.chapter, data_dir=args.data_dir)
-        print(guard_output(f"extract-a: wrote {count} item files for Chapter {args.chapter}"))
-        print(guard_output(f"Item IDs: {ids[0]}..{ids[-1]}" if ids else "Item IDs: none"))
-        if warnings:
-            print(guard_output(f"Warnings: {len(warnings)} (IDs: {[w[0] for w in warnings]})"))
+        try:
+            count, ids, warnings = extract_chapter_a(args.chapter, data_dir=args.data_dir, unfreeze=args.unfreeze)
+            print(guard_output(f"extract-a: wrote {count} item files for Chapter {args.chapter}"))
+            print(guard_output(f"Item IDs: {ids[0]}..{ids[-1]}" if ids else "Item IDs: none"))
+            if warnings:
+                print(guard_output(f"Warnings: {len(warnings)} (IDs: {[w[0] for w in warnings]})"))
+        except RuntimeError as e:
+            print(guard_output(f"ERROR: {e}"))
+            sys.exit(1)
 
     elif args.subcommand == "validate-key":
         valid, errors = validate_key_file(args.key_file)
@@ -3052,13 +3276,17 @@ def main():
         print(guard_output(f"review-queue: {len(queue)} slots queued for Chapter {args.chapter}"))
 
     elif args.subcommand == "resolve":
-        rep = resolve_chapter(args.chapter, data_dir=args.data_dir)
-        s = rep["summary"]
-        print(guard_output(
-            f"resolve: Chapter {args.chapter} resolved. "
-            f"usable={s['usable_items']}, excluded={s['excluded_items']}. "
-            f"Slot outcomes: {rep['slot_outcomes']}"
-        ))
+        try:
+            rep = resolve_chapter(args.chapter, data_dir=args.data_dir, unfreeze=args.unfreeze)
+            s = rep["summary"]
+            print(guard_output(
+                f"resolve: Chapter {args.chapter} resolved. "
+                f"usable={s['usable_items']}, excluded={s['excluded_items']}. "
+                f"Slot outcomes: {rep['slot_outcomes']}"
+            ))
+        except RuntimeError as e:
+            print(guard_output(f"ERROR: {e}"))
+            sys.exit(1)
 
     elif args.subcommand == "concepts":
         concepts = extract_concepts_from_chapter(args.chapter, data_dir=args.data_dir)
@@ -3076,27 +3304,39 @@ def main():
             sys.exit(1)
 
     elif args.subcommand == "difficulty-screen":
-        rep = difficulty_screen_chapter(args.chapter, data_dir=args.data_dir)
-        s = rep["summary"]
-        print(guard_output(
-            f"difficulty-screen: total={s['total_b_items']}, flagged={s['flagged_items']}, passed={s['passed_items']}, unscreened={s.get('unscreened_items', 0)}"
-        ))
+        try:
+            rep = difficulty_screen_chapter(args.chapter, data_dir=args.data_dir, unfreeze=args.unfreeze)
+            s = rep["summary"]
+            print(guard_output(
+                f"difficulty-screen: total={s['total_b_items']}, flagged={s['flagged_items']}, passed={s['passed_items']}, unscreened={s.get('unscreened_items', 0)}"
+            ))
+        except RuntimeError as e:
+            print(guard_output(f"ERROR: {e}"))
+            sys.exit(1)
 
     elif args.subcommand == "select-b":
-        res = select_b_chapter(args.chapter, target=args.target, data_dir=args.data_dir)
-        print(guard_output(
-            f"select-b: selected {res['selected_count']}/{res['target']} items. "
-            f"claude={res['family_counts'].get('claude', 0)}, gemini={res['family_counts'].get('gemini', 0)}. "
-            f"uncovered_with_candidate={res['uncovered_with_candidate']}"
-        ))
-        if not res["success"]:
+        try:
+            res = select_b_chapter(args.chapter, target=args.target, data_dir=args.data_dir, unfreeze=args.unfreeze)
+            print(guard_output(
+                f"select-b: selected {res['selected_count']}/{res['target']} items. "
+                f"claude={res['family_counts'].get('claude', 0)}, gemini={res['family_counts'].get('gemini', 0)}. "
+                f"uncovered_with_candidate={res['uncovered_with_candidate']}"
+            ))
+            if not res["success"]:
+                sys.exit(1)
+        except RuntimeError as e:
+            print(guard_output(f"ERROR: {e}"))
             sys.exit(1)
 
     elif args.subcommand == "merge-tags":
-        res = merge_tags_chapter(args.chapter, data_dir=args.data_dir)
-        print(guard_output(
-            f"merge-tags: updated {len(res['updated_items'])} usable A items for Chapter {args.chapter}"
-        ))
+        try:
+            res = merge_tags_chapter(args.chapter, data_dir=args.data_dir, unfreeze=args.unfreeze)
+            print(guard_output(
+                f"merge-tags: updated {len(res['updated_items'])} usable A items for Chapter {args.chapter}"
+            ))
+        except RuntimeError as e:
+            print(guard_output(f"ERROR: {e}"))
+            sys.exit(1)
 
     elif args.subcommand == "screen-feedback":
         entries = screen_feedback_chapter(args.chapter, args.family, data_dir=args.data_dir)
@@ -3120,6 +3360,33 @@ def main():
             if rep.get("uncovered_a_failures"):
                 print(guard_output(f"coverage failure (A): uncovered concepts with candidates: {rep['uncovered_a_failures']}"))
             sys.exit(1)
+
+    elif args.subcommand == "freeze":
+        try:
+            rep = freeze_chapter(args.chapter, data_dir=args.data_dir)
+            print(guard_output(f"freeze: Chapter {args.chapter} FROZEN ({len(rep['files'])} files hashed)"))
+            sys.exit(0)
+        except Exception as e:
+            print(guard_output(f"ERROR: {e}"))
+            sys.exit(1)
+
+    elif args.subcommand == "verify-frozen":
+        ok, rep = verify_frozen_chapter(args.chapter, data_dir=args.data_dir)
+        if ok:
+            print(guard_output(f"verify-frozen: Chapter {args.chapter} VERIFIED ({rep['matched']} files match)"))
+            sys.exit(0)
+        else:
+            print(guard_output(f"verify-frozen: Chapter {args.chapter} FAILED (mismatches={len(rep.get('mismatches', []))}, missing={len(rep.get('missing', []))})"))
+            sys.exit(1)
+
+    elif args.subcommand == "unfreeze":
+        was_frozen = check_frozen(args.chapter, data_dir=args.data_dir, unfreeze=True)
+        if was_frozen:
+            print(guard_output(f"unfreeze: Chapter {args.chapter} UNFROZEN"))
+            sys.exit(0)
+        else:
+            print(guard_output(f"unfreeze: Chapter {args.chapter} was not frozen"))
+            sys.exit(0)
 
 
 if __name__ == "__main__":
