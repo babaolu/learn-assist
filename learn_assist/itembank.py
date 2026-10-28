@@ -1996,23 +1996,47 @@ def merge_tags_chapter(
             if (it.get("bucket") == "A" or iid.startswith("A_")) and it.get("status") not in {"excluded", "disputed"}
         }
 
+    def parse_entry(entry: Any) -> Tuple[Set[str], Set[str]]:
+        if isinstance(entry, list):
+            return set(entry), set()
+        elif isinstance(entry, dict):
+            c = entry.get("concepts", [])
+            b = entry.get("background", [])
+            return set(c if isinstance(c, list) else []), set(b if isinstance(b, list) else [])
+        return set(), set()
+
     updated_items: List[str] = []
     merged_tags_map: Dict[str, List[str]] = {}
+    merged_bg_map: Dict[str, List[str]] = {}
 
     for iid in sorted(usable_a_ids):
-        c_set = set(claude_tags.get(iid, []))
-        g_set = set(gemini_tags.get(iid, []))
+        c_c, c_b = parse_entry(claude_tags.get(iid))
+        g_c, g_b = parse_entry(gemini_tags.get(iid))
 
-        inter = c_set & g_set
-        if inter:
-            merged = sorted(list(inter))
+        # Concepts: intersection, else union
+        if c_c and g_c:
+            inter_c = c_c & g_c
+            merged_c = sorted(list(inter_c if inter_c else (c_c | g_c)))
         else:
-            merged = sorted(list(c_set | g_set))
+            merged_c = sorted(list(c_c | g_c))
 
-        merged_tags_map[iid] = merged
+        # Background: intersection, else union
+        if c_b and g_b:
+            inter_b = c_b & g_b
+            merged_b = sorted(list(inter_b if inter_b else (c_b | g_b)))
+        else:
+            merged_b = sorted(list(c_b | g_b))
+
+        merged_tags_map[iid] = merged_c
+        merged_bg_map[iid] = merged_b
+
         if iid in item_files:
             it_data = items_by_id[iid]
-            it_data["concepts"] = merged
+            it_data["concepts"] = merged_c
+            if merged_b:
+                it_data["background"] = merged_b
+            elif "background" in it_data:
+                del it_data["background"]
             item_files[iid].write_text(json.dumps(it_data, indent=2) + "\n", encoding="utf-8")
             updated_items.append(iid)
 
@@ -2020,7 +2044,8 @@ def merge_tags_chapter(
         "chapter": ch_num,
         "usable_a_count": len(usable_a_ids),
         "updated_items": updated_items,
-        "merged_tags": merged_tags_map
+        "merged_tags": merged_tags_map,
+        "merged_background": merged_bg_map
     }
 
 
@@ -3007,24 +3032,32 @@ def freeze_chapter(
 
     if not res_file.exists():
         raise RuntimeError(f"resolve has not run: {res_file.name} missing")
-    if not diff_file.exists():
-        raise RuntimeError(f"difficulty-screen has not run: {diff_file.name} missing")
-    if not sel_file.exists():
-        raise RuntimeError(f"select-b has not run: selection file missing")
-    if not cov_file.exists():
-        raise RuntimeError(f"coverage has not run: {cov_file.name} missing")
-
-    sel_data = json.loads(sel_file.read_text(encoding="utf-8"))
-    if not sel_data.get("success"):
-        raise RuntimeError("select-b did not succeed (exit 0)")
-
-    cov_data = json.loads(cov_file.read_text(encoding="utf-8"))
-    if not cov_data.get("success"):
-        raise RuntimeError("coverage did not succeed (exit 0)")
 
     res_data = json.loads(res_file.read_text(encoding="utf-8"))
     usable_a_item_ids = sorted([it for it in res_data.get("usable_item_ids", []) if it.startswith("A_")])
-    selected_b_item_ids = sorted(sel_data.get("selected_items") or sel_data.get("selected_item_ids") or [])
+
+    # Check if there are any B items in the chapter items
+    items_dir = ch_dir / "items"
+    has_b_items = items_dir.exists() and any(p.name.startswith("B_") for p in items_dir.glob("*.json"))
+
+    selected_b_item_ids: List[str] = []
+    if has_b_items:
+        if not diff_file.exists():
+            raise RuntimeError(f"difficulty-screen has not run: {diff_file.name} missing")
+        if not sel_file.exists():
+            raise RuntimeError(f"select-b has not run: selection file missing")
+        if not cov_file.exists():
+            raise RuntimeError(f"coverage has not run: {cov_file.name} missing")
+
+        sel_data = json.loads(sel_file.read_text(encoding="utf-8"))
+        if not sel_data.get("success"):
+            raise RuntimeError("select-b did not succeed (exit 0)")
+
+        cov_data = json.loads(cov_file.read_text(encoding="utf-8"))
+        if not cov_data.get("success"):
+            raise RuntimeError("coverage did not succeed (exit 0)")
+
+        selected_b_item_ids = sorted(sel_data.get("selected_items") or sel_data.get("selected_item_ids") or [])
 
     frozen_items = sorted(list(set(usable_a_item_ids + selected_b_item_ids)))
 
@@ -3116,6 +3149,83 @@ def verify_frozen_chapter(
         "missing": missing,
         "success": success
     }
+
+
+def placement_check_chapter(
+    chapter: Any,
+    data_dir: Path = Path("data"),
+    threshold_per_topic: int = 4
+) -> Tuple[bool, Dict[str, int], List[str]]:
+    """
+    Over the frozen diagnostic items, counts usable checkable slots per counted topic.
+    Exit non-zero if any counted topic has fewer than 4.
+    """
+    ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+    ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}"
+    frozen_file = ch_dir / "FROZEN.json"
+
+    if not frozen_file.exists():
+        raise RuntimeError(f"FROZEN.json does not exist for chapter {ch_num:02d}")
+
+    from learn_assist.placement import COUNTED_TOPICS, extract_slot_topics, CHECKABLE_SLOT_TYPES
+
+    frozen_data = json.loads(frozen_file.read_text(encoding="utf-8"))
+    frozen_items = sorted(list(set(frozen_data.get("usable_a_item_ids", []) + frozen_data.get("selected_b_item_ids", []))))
+
+    res_file = ch_dir / "resolution.json"
+    items_res = {}
+    if res_file.exists():
+        try:
+            res_data = json.loads(res_file.read_text(encoding="utf-8"))
+            items_res = res_data.get("items", {})
+        except Exception:
+            pass
+
+    USABLE_SLOT_OUTCOMES = {"agree", "agreed", "verified", "resolved_by_concession"}
+
+    topic_counts: Dict[str, int] = {t: 0 for t in COUNTED_TOPICS}
+
+    for item_id in frozen_items:
+        it_file = ch_dir / "items" / f"{item_id}.json"
+        sl_file = ch_dir / "slots" / f"{item_id}.json"
+        if not it_file.exists() or not sl_file.exists():
+            continue
+
+        it_data = json.loads(it_file.read_text(encoding="utf-8"))
+        sl_data = json.loads(sl_file.read_text(encoding="utf-8"))
+
+        item_concepts = it_data.get("concepts", [])
+        item_bg = it_data.get("background", [])
+
+        res_slots_map = {}
+        if item_id in items_res:
+            for s_res in items_res[item_id].get("slots", []):
+                res_slots_map[s_res.get("slot_id")] = s_res.get("outcome")
+
+        for s in sl_data.get("slots", []):
+            stype = str(s.get("kind", s.get("slot_type", ""))).lower()
+            if stype not in CHECKABLE_SLOT_TYPES:
+                continue
+
+            sid = s.get("slot_id")
+            if sid in res_slots_map:
+                if res_slots_map[sid] not in USABLE_SLOT_OUTCOMES:
+                    continue
+
+            slot_info = {
+                "concepts": s.get("concepts", item_concepts),
+                "background": s.get("background", item_bg),
+                "topic": s.get("topic", it_data.get("topic")),
+                "slot_type": stype
+            }
+            slot_topics = extract_slot_topics(slot_info)
+            for t in slot_topics:
+                if t in topic_counts:
+                    topic_counts[t] += 1
+
+    failing = [t for t in COUNTED_TOPICS if topic_counts[t] < threshold_per_topic]
+    passed = (len(failing) == 0)
+    return passed, topic_counts, failing
 
 
 # ---------------------------------------------------------------------------
@@ -3232,6 +3342,11 @@ def main():
     p_unfreeze = subparsers.add_parser("unfreeze", help="Unfreeze itembank for a chapter")
     p_unfreeze.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
     p_unfreeze.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
+
+    # placement-check
+    p_pcheck = subparsers.add_parser("placement-check", help="Check checkable slot counts per counted topic on frozen items")
+    p_pcheck.add_argument("chapter", help="Chapter number (e.g. 2, 02, ch02)")
+    p_pcheck.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
 
     args = parser.parse_args()
 
@@ -3420,6 +3535,22 @@ def main():
         else:
             print(guard_output(f"unfreeze: Chapter {args.chapter} was not frozen"))
             sys.exit(0)
+
+    elif args.subcommand == "placement-check":
+        try:
+            passed, counts, failing = placement_check_chapter(args.chapter, data_dir=args.data_dir)
+            print(guard_output(f"placement-check: Chapter {args.chapter}"))
+            for t, cnt in counts.items():
+                print(guard_output(f"  {t}: {cnt}"))
+            if not passed:
+                print(guard_output(f"placement-check FAILED: topics with < 4 slots: {failing}"))
+                sys.exit(1)
+            else:
+                print(guard_output("placement-check PASSED: all counted topics have >= 4 slots"))
+                sys.exit(0)
+        except Exception as e:
+            print(guard_output(f"ERROR: {e}"))
+            sys.exit(1)
 
 
 if __name__ == "__main__":

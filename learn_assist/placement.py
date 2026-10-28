@@ -23,20 +23,20 @@ OVERALL_THRESHOLD: float = 0.90
 TOPIC_THRESHOLD: float = 0.70
 
 COUNTED_TOPICS: List[str] = [
-    "2.1",
-    "2.2",
-    "2.3",
-    "2.4",
-    "2.5",
+    "vectors",
+    "matrix_algebra",
+    "standard_functions",
+    "convolution",
+    "fourier",
     "complex_exponentials"
 ]
 
 TOPIC_DESCRIPTIONS: Dict[str, str] = {
-    "2.1": "vectors (2.1)",
-    "2.2": "matrix algebra (2.2)",
-    "2.3": "standard functions (rect, sinc, delta; 2.3)",
-    "2.4": "convolution (2.4)",
-    "2.5": "Fourier transform (2.5)",
+    "vectors": "vectors (2.1)",
+    "matrix_algebra": "matrix algebra (2.2)",
+    "standard_functions": "standard functions (rect, sinc, delta; 2.3)",
+    "convolution": "convolution (2.4)",
+    "fourier": "Fourier transform (2.5)",
     "complex_exponentials": "complex exponentials (background tag)"
 }
 
@@ -47,23 +47,32 @@ CHECKABLE_SLOT_TYPES: Set[str] = {
 }
 
 TOPIC_ALIASES: Dict[str, str] = {
-    "vectors": "2.1",
-    "vector": "2.1",
-    "2.1": "2.1",
-    "matrix_algebra": "2.2",
-    "matrices": "2.2",
-    "matrix": "2.2",
-    "2.2": "2.2",
-    "standard_functions": "2.3",
-    "functions": "2.3",
-    "2.3": "2.3",
-    "convolution": "2.4",
-    "2.4": "2.4",
-    "fourier_transform": "2.5",
-    "fourier": "2.5",
-    "2.5": "2.5",
+    "vectors": "vectors",
+    "vector": "vectors",
+    "2.1": "vectors",
+    "matrix_algebra": "matrix_algebra",
+    "matrices": "matrix_algebra",
+    "matrix": "matrix_algebra",
+    "2.2": "matrix_algebra",
+    "standard_functions": "standard_functions",
+    "functions": "standard_functions",
+    "2.3": "standard_functions",
+    "convolution": "convolution",
+    "2.4": "convolution",
+    "fourier_transform": "fourier",
+    "fourier": "fourier",
+    "2.5": "fourier",
     "complex_exponentials": "complex_exponentials",
     "complex_exponential": "complex_exponentials"
+}
+
+TOPIC_TO_NUMBER: Dict[str, str] = {
+    "vectors": "2.1",
+    "matrix_algebra": "2.2",
+    "standard_functions": "2.3",
+    "convolution": "2.4",
+    "fourier": "2.5",
+    "complex_exponentials": "complex_exponentials"
 }
 
 
@@ -84,8 +93,10 @@ class PlacementResult(NamedTuple):
 def extract_slot_topics(slot_data: Dict[str, Any]) -> Set[str]:
     """
     Determines which counted topics apply to a slot.
-    Excludes Bessel functions (2.3.12) from counted topic 2.3.
-    Excludes Radon transform (2.6) from counted topics.
+    vectors = 2.1; matrix_algebra = 2.2; standard_functions = 2.3.1–2.3.11;
+    convolution = 2.4; fourier = 2.5.1–2.5.3; complex_exponentials = background tag "complex_exponentials".
+    Overall-only: 2.3.12 and 2.6.*.
+    A slot counts toward a topic if its item carries that concept or tag.
     """
     topics: Set[str] = set()
 
@@ -108,16 +119,23 @@ def extract_slot_topics(slot_data: Dict[str, Any]) -> Set[str]:
     if isinstance(concepts, list):
         for c in concepts:
             c_str = str(c).strip()
-            # Bessel function exclusion
+            # Bessel function (2.3.12) exclusion from counted topics (overall-only)
             if c_str == "2.3.12" or "bessel" in c_str.lower():
                 continue
-            # Radon is 2.6 (not in COUNTED_TOPICS, counts only toward overall)
+            # Radon (2.6.*) exclusion from counted topics (overall-only)
             if c_str.startswith("2.6"):
                 continue
-            # Match 2.1, 2.2, 2.3, 2.4, 2.5
-            for prefix in ["2.1", "2.2", "2.3", "2.4", "2.5"]:
-                if c_str == prefix or c_str.startswith(f"{prefix}."):
-                    topics.add(prefix)
+
+            if c_str == "2.1" or c_str.startswith("2.1."):
+                topics.add("vectors")
+            elif c_str == "2.2" or c_str.startswith("2.2."):
+                topics.add("matrix_algebra")
+            elif c_str == "2.3" or c_str.startswith("2.3."):
+                topics.add("standard_functions")
+            elif c_str == "2.4" or c_str.startswith("2.4."):
+                topics.add("convolution")
+            elif c_str == "2.5" or c_str.startswith("2.5."):
+                topics.add("fourier")
 
     # Background tags
     bg = slot_data.get("background", [])
@@ -220,11 +238,12 @@ def score_placement(
     failing_topics: List[str] = []
 
     for t in counted_topics:
+        norm_t = TOPIC_ALIASES.get(t, t)
         # Find slots that exercise topic t
         slots_in_t = []
         for s in checkable_slots:
             s_topics = extract_slot_topics(s)
-            if t in s_topics:
+            if norm_t in s_topics or t in s_topics:
                 slots_in_t.append(s)
 
         if not slots_in_t:
@@ -245,6 +264,12 @@ def score_placement(
             t_passed = (t_rate >= topic_threshold)
 
         topic_rates[t] = t_rate
+        if norm_t != t:
+            topic_rates[norm_t] = t_rate
+        num_alias = TOPIC_TO_NUMBER.get(norm_t)
+        if num_alias:
+            topic_rates[num_alias] = t_rate
+
         if not t_passed:
             failing_topics.append(t)
 

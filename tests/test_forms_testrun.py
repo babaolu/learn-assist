@@ -368,3 +368,33 @@ def test_code_ast_contains_no_sensitive_read_references():
                 assert not any(p in val for p in ["keys/", "slotted/", "reviews/", "compare_", "resolution.json"]), (
                     f"Found potential sensitive reference in {filename}: {val}"
                 )
+
+
+def test_make_forms_single(tmp_path):
+    """
+    Test make_forms with --single produces one form containing all frozen items,
+    with sittings of at most 10 in seeded order.
+    """
+    bank = create_synthetic_frozen_bank(tmp_path, chapter=2)
+    res = make_forms(2, seed=20261028, data_dir=tmp_path, single="diagnostic")
+
+    assert res["chapter"] == 2
+    assert res["seed"] == 20261028
+    assert res["single"] == "diagnostic"
+    assert "diagnostic" in res["forms"]
+    assert "baseline" not in res["forms"]
+    assert "final" not in res["forms"]
+
+    diag_form = res["forms"]["diagnostic"]
+    total_items = len(diag_form["item_ids"])
+    assert total_items == 10  # 6 A items + 4 B items in create_synthetic_frozen_bank
+
+    # Sittings of at most 10
+    sittings = diag_form["sittings"]
+    assert len(sittings) == 1
+    assert len(sittings[0]["item_ids"]) == 10
+
+    # Repeat with same seed should produce identical order
+    res2 = make_forms(2, seed=20261028, data_dir=tmp_path, single="diagnostic")
+    assert res2["forms"]["diagnostic"]["item_ids"] == diag_form["item_ids"]
+

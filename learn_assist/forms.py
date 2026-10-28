@@ -35,14 +35,15 @@ def assert_safe_path(path: Any) -> None:
 def make_forms(
     chapter: Any,
     seed: int,
-    data_dir: Path = Path("data")
+    data_dir: Path = Path("data"),
+    single: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Splits frozen chapter items into 'baseline' and 'final' forms.
+    Splits frozen chapter items into 'baseline' and 'final' forms, or a single form if single is specified.
     Exits non-zero if:
     - FROZEN.json is missing or verify-frozen fails.
-    - The two forms differ in B count by more than 1.
-    - Any concept with selected B items ends up with 0 in one form while the other has >= 2.
+    - When not single: the two forms differ in B count by more than 1.
+    - When not single: any concept with selected B items ends up with 0 in one form while the other has >= 2.
     """
     ch_num = int(re.sub(r"^[a-zA-Z_]+", "", str(chapter)))
     data_dir = Path(data_dir)
@@ -98,6 +99,98 @@ def make_forms(
             "anchor_item": d.get("anchor_item"),
             "concepts": sorted(list(d.get("concepts", [])))
         }
+
+    chunk_size = 10
+
+    if single:
+        all_items = sorted(usable_a_ids + selected_b_ids)
+        form_rng = random.Random(f"{seed}_{single}")
+        form_rng.shuffle(all_items)
+
+        sittings: List[Dict[str, Any]] = []
+        for i in range(0, len(all_items), chunk_size):
+            chunk = all_items[i : i + chunk_size]
+            sitting_idx = len(sittings) + 1
+
+            sitting_a_count = sum(1 for item_id in chunk if items_meta[item_id]["bucket"] == "A")
+            sitting_b_count = sum(1 for item_id in chunk if items_meta[item_id]["bucket"] == "B")
+
+            sitting_concept_counts = Counter()
+            sitting_concept_a = Counter()
+            sitting_concept_b = Counter()
+            for item_id in chunk:
+                bucket = items_meta[item_id]["bucket"]
+                for c in items_meta[item_id]["concepts"]:
+                    sitting_concept_counts[c] += 1
+                    if bucket == "A":
+                        sitting_concept_a[c] += 1
+                    else:
+                        sitting_concept_b[c] += 1
+
+            sittings.append({
+                "sitting": sitting_idx,
+                "item_ids": chunk,
+                "counts": {
+                    "total": len(chunk),
+                    "by_bucket": {
+                        "A": sitting_a_count,
+                        "B": sitting_b_count
+                    },
+                    "by_concept": dict(sorted(sitting_concept_counts.items())),
+                    "by_concept_and_bucket": {
+                        "A": dict(sorted(sitting_concept_a.items())),
+                        "B": dict(sorted(sitting_concept_b.items()))
+                    }
+                }
+            })
+
+        form_total = len(all_items)
+        form_a_count = sum(1 for item_id in all_items if items_meta[item_id]["bucket"] == "A")
+        form_b_count = sum(1 for item_id in all_items if items_meta[item_id]["bucket"] == "B")
+
+        form_concept_counts = Counter()
+        form_concept_a = Counter()
+        form_concept_b = Counter()
+        for item_id in all_items:
+            bucket = items_meta[item_id]["bucket"]
+            for c in items_meta[item_id]["concepts"]:
+                form_concept_counts[c] += 1
+                if bucket == "A":
+                    form_concept_a[c] += 1
+                else:
+                    form_concept_b[c] += 1
+
+        forms_output: Dict[str, Any] = {
+            single: {
+                "item_ids": all_items,
+                "counts": {
+                    "total": form_total,
+                    "by_bucket": {
+                        "A": form_a_count,
+                        "B": form_b_count
+                    },
+                    "by_concept": dict(sorted(form_concept_counts.items())),
+                    "by_concept_and_bucket": {
+                        "A": dict(sorted(form_concept_a.items())),
+                        "B": dict(sorted(form_concept_b.items()))
+                    }
+                },
+                "sittings": sittings
+            }
+        }
+
+        out_data = {
+            "chapter": ch_num,
+            "seed": seed,
+            "single": single,
+            "frozen_hash": frozen_hash,
+            "forms": forms_output
+        }
+
+        out_file = ch_dir / "forms.json"
+        assert_safe_path(out_file)
+        out_file.write_text(json.dumps(out_data, indent=2) + "\n", encoding="utf-8")
+        return out_data
 
     # Group into anchor units: each unit has 1 A item and 0 or more attached B items
     anchor_to_b: Dict[str, List[str]] = {}
@@ -356,19 +449,20 @@ def main():
     parser = argparse.ArgumentParser(description="Deterministic form generator for learn-assist.")
     parser.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
     parser.add_argument("--seed", type=int, required=True, help="Deterministic random seed")
+    parser.add_argument("--single", type=str, default=None, help="Produce a single form containing all frozen items")
     parser.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
 
     args = parser.parse_args()
-    res = make_forms(args.chapter, args.seed, data_dir=args.data_dir)
+    res = make_forms(args.chapter, args.seed, data_dir=args.data_dir, single=args.single)
 
     # BLINDING compliant output: IDs and counts only
-    print(f"FORMS GENERATED: chapter={res["chapter"]} seed={res["seed"]}")
+    print(f"FORMS GENERATED: chapter={res['chapter']} seed={res['seed']}")
     for fname, fdata in res["forms"].items():
         cnt = fdata["counts"]
-        print(f"Form '{fname}': total={cnt["total"]} A={cnt["by_bucket"]["A"]} B={cnt["by_bucket"]["B"]} sittings={len(fdata["sittings"])}")
+        print(f"Form '{fname}': total={cnt['total']} A={cnt['by_bucket']['A']} B={cnt['by_bucket']['B']} sittings={len(fdata['sittings'])}")
         for s in fdata["sittings"]:
             sc = s["counts"]
-            print(f"  Sitting {s["sitting"]}: total={sc["total"]} A={sc["by_bucket"]["A"]} B={sc["by_bucket"]["B"]}")
+            print(f"  Sitting {s['sitting']}: total={sc['total']} A={sc['by_bucket']['A']} B={sc['by_bucket']['B']}")
 
 
 if __name__ == "__main__":
