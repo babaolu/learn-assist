@@ -306,6 +306,15 @@ def extract_chapter_a(
 VALID_MODEL_FAMILIES = {"claude", "gemini"}
 VALID_CONFIDENCES = {"high", "medium", "low"}
 VALID_KINDS = {"numeric", "expression", "choice", "text"}
+VALID_BACKGROUND_TAGS = {
+    "complex_numbers",
+    "complex_exponentials",
+    "calculus_integration",
+    "calculus_differentiation",
+    "linear_algebra",
+    "trigonometry",
+    "series"
+}
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +473,16 @@ def validate_item(
             for c in item_concepts:
                 if c not in valid_concept_set:
                     errors.append(f"Unknown concept ID: {c}")
+
+    # Check background if present
+    item_bg = data.get("background")
+    if item_bg is not None:
+        if not isinstance(item_bg, list) or not all(isinstance(b, str) for b in item_bg):
+            errors.append("background must be a list of strings")
+        else:
+            for b in item_bg:
+                if b not in VALID_BACKGROUND_TAGS:
+                    errors.append(f"Unknown background tag: '{b}'")
 
     # Specific Bucket B checks
     if bucket == "B":

@@ -14,6 +14,13 @@ Principles of Magnetic Resonance Imaging (IEEE Press, 2000).
 4. Minimum 7-day gap, during which other material may be studied.
 5. Final test. Compare to baseline.
 
+# PLACEMENT RULE
+The learner is solid on Chapter 2 only if BOTH hold on the diagnostic's code-checkable answer slots (numeric, expression and choice; text slots are graded separately and reported but do not decide placement):
+(1) at least 90% of all checkable slots correct;
+(2) at least 70% correct within EACH counted topic: vectors (2.1), matrix algebra (2.2), standard functions (rect, sinc, delta; 2.3), convolution (2.4), Fourier transform (2.5), and complex exponentials (background tag).
+Radon (2.6) and Bessel functions count only toward (1).
+If not solid, Chapter 2 becomes the target and the diagnostic serves as its baseline. If failures concentrate in background maths below Chapter 2, the experiment pauses for the learner's decision.
+
 # MASTERY RULE
 A concept is mastered when the learner explains it correctly unaided AND
 applies it to a previously unseen problem, on two different days. No
