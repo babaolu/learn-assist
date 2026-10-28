@@ -3043,13 +3043,15 @@ def freeze_chapter(
 
 def verify_frozen_chapter(
     chapter: Any,
-    data_dir: Path = Path("data")
+    data_dir: Path = Path("data"),
+    exclude_sensitive: bool = False
 ) -> Tuple[bool, Dict[str, Any]]:
     """
     Verifies the integrity of frozen files against FROZEN.json.
     Returns (success, report_dict).
     """
     ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+    data_dir = Path(data_dir)
     ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}"
     frozen_file = ch_dir / "FROZEN.json"
 
@@ -3062,8 +3064,18 @@ def verify_frozen_chapter(
     mismatches: List[str] = []
     missing: List[str] = []
     matched: int = 0
+    checked: int = 0
 
     for rel_path, expected_hash in files_map.items():
+        if exclude_sensitive:
+            norm = rel_path.replace("\\", "/").lower()
+            if (norm.startswith("keys/") or "/keys/" in norm or
+                norm.startswith("slotted/") or "/slotted/" in norm or
+                norm.startswith("reviews/") or "/reviews/" in norm or
+                "compare" in norm or "resolution" in norm):
+                continue
+
+        checked += 1
         f = ch_dir / rel_path
         if not f.exists():
             missing.append(rel_path)
@@ -3074,10 +3086,11 @@ def verify_frozen_chapter(
             else:
                 matched += 1
 
-    success = (len(mismatches) == 0 and len(missing) == 0)
+    success = (len(mismatches) == 0 and len(missing) == 0 and (checked > 0 or len(files_map) == 0))
     return success, {
         "chapter": ch_num,
         "total_files": len(files_map),
+        "checked_files": checked,
         "matched": matched,
         "mismatches": mismatches,
         "missing": missing,
