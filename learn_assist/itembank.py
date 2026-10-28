@@ -2167,6 +2167,57 @@ def difficulty_screen_chapter(
     return report
 
 
+def screen_feedback_chapter(
+    chapter: Any,
+    family: str,
+    data_dir: Path = Path("data")
+) -> List[Dict[str, Any]]:
+    """
+    For each B item authored by <family> and flagged by difficulty-screen,
+    returns item_id, anchor_id, solver length ratio (B solution chars / anchor solution chars)
+    and the solver's confidence for each.
+    """
+    ch_num = int(re.sub(r'^[a-zA-Z_]+', '', str(chapter)))
+    ch_dir = data_dir / "itembank" / f"ch{ch_num:02d}"
+    diff_file = ch_dir / "difficulty.json"
+
+    if diff_file.exists():
+        try:
+            diff_data = json.loads(diff_file.read_text(encoding="utf-8"))
+        except Exception:
+            diff_data = difficulty_screen_chapter(ch_num, data_dir=data_dir)
+    else:
+        diff_data = difficulty_screen_chapter(ch_num, data_dir=data_dir)
+
+    results = []
+    items_map = diff_data.get("items", {})
+    for item_id in sorted(items_map.keys()):
+        item = items_map[item_id]
+        if item.get("author_family", "").lower() != family.lower():
+            continue
+        if not (item.get("flagged") or item.get("status") in ("flagged", "unscreened")):
+            continue
+
+        anchor_id = item.get("anchor_item", "")
+        b_chars = item.get("b_chars", 0)
+        a_chars = item.get("a_chars", 0)
+        ratio = round(b_chars / a_chars, 2) if a_chars > 0 else 0.0
+        b_conf = item.get("b_confidence", "")
+        a_conf = item.get("a_confidence", "")
+
+        results.append({
+            "item_id": item_id,
+            "anchor_id": anchor_id,
+            "ratio": ratio,
+            "b_chars": b_chars,
+            "a_chars": a_chars,
+            "b_confidence": b_conf,
+            "a_confidence": a_conf
+        })
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Bucket B Selection & Concept Coverage
 # ---------------------------------------------------------------------------
@@ -2518,13 +2569,33 @@ def check_coverage_chapter(
             "usable_b_candidate_count": usable_b_cand_count
         })
 
-    success = (len(uncovered_with_candidate) == 0 and len(uncovered_a_with_candidate) == 0)
+    # Read coverage exceptions if present
+    exceptions_file = ch_dir / "coverage_exceptions.json"
+    exceptions: Dict[str, str] = {}
+    if exceptions_file.exists():
+        try:
+            exceptions = json.loads(exceptions_file.read_text(encoding="utf-8"))
+        except Exception:
+            exceptions = {}
+
+    uncovered_b_failures = [cid for cid in uncovered_with_candidate if cid not in exceptions]
+    uncovered_b_warnings = [cid for cid in uncovered_with_candidate if cid in exceptions]
+
+    uncovered_a_failures = [cid for cid in uncovered_a_with_candidate if cid not in exceptions]
+    uncovered_a_warnings = [cid for cid in uncovered_a_with_candidate if cid in exceptions]
+
+    success = (len(uncovered_b_failures) == 0 and len(uncovered_a_failures) == 0)
 
     report = {
         "chapter": ch_num,
         "concepts": concept_stats,
         "uncovered_with_candidate": uncovered_with_candidate,
         "uncovered_a_with_candidate": uncovered_a_with_candidate,
+        "uncovered_b_failures": uncovered_b_failures,
+        "uncovered_b_warnings": uncovered_b_warnings,
+        "uncovered_a_failures": uncovered_a_failures,
+        "uncovered_a_warnings": uncovered_a_warnings,
+        "exceptions": exceptions,
         "success": success
     }
 
@@ -2898,6 +2969,12 @@ def main():
     p_mergetags.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
     p_mergetags.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
 
+    # screen-feedback
+    p_screenfb = subparsers.add_parser("screen-feedback", help="Print feedback on flagged B items for a model family")
+    p_screenfb.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
+    p_screenfb.add_argument("--family", required=True, help="Model family (e.g. claude, gemini)")
+    p_screenfb.add_argument("--data-dir", type=Path, default=Path("data"), help="Root data directory")
+
     # coverage
     p_cov = subparsers.add_parser("coverage", help="Check concept coverage for A and B items")
     p_cov.add_argument("chapter", help="Chapter number (e.g. 3, 03, ch03)")
@@ -3021,16 +3098,27 @@ def main():
             f"merge-tags: updated {len(res['updated_items'])} usable A items for Chapter {args.chapter}"
         ))
 
+    elif args.subcommand == "screen-feedback":
+        entries = screen_feedback_chapter(args.chapter, args.family, data_dir=args.data_dir)
+        for e in entries:
+            print(guard_output(f"{e['item_id']} {e['anchor_id']} {e['ratio']:.2f} {e['b_confidence']} {e['a_confidence']}"))
+
     elif args.subcommand == "coverage":
         rep = check_coverage_chapter(args.chapter, data_dir=args.data_dir)
         print(guard_output(f"coverage: {len(rep['concepts'])} concepts checked"))
         for c in rep["concepts"]:
             print(guard_output(f"  {c['concept_id']} ({c['title']}): usable_A={c['usable_a_count']}, selected_B={c['selected_b_count']}"))
+
+        warn_cids = sorted(list(set(rep.get("uncovered_b_warnings", []) + rep.get("uncovered_a_warnings", []))))
+        for cid in warn_cids:
+            reason = rep.get("exceptions", {}).get(cid, "Documented exception")
+            print(guard_output(f"coverage warning: concept {cid} uncovered (WARN: {reason})"))
+
         if not rep["success"]:
-            if rep.get("uncovered_with_candidate"):
-                print(guard_output(f"coverage failure (B): uncovered concepts with candidates: {rep['uncovered_with_candidate']}"))
-            if rep.get("uncovered_a_with_candidate"):
-                print(guard_output(f"coverage failure (A): uncovered concepts with candidates: {rep['uncovered_a_with_candidate']}"))
+            if rep.get("uncovered_b_failures"):
+                print(guard_output(f"coverage failure (B): uncovered concepts with candidates: {rep['uncovered_b_failures']}"))
+            if rep.get("uncovered_a_failures"):
+                print(guard_output(f"coverage failure (A): uncovered concepts with candidates: {rep['uncovered_a_failures']}"))
             sys.exit(1)
 
 

@@ -42,7 +42,8 @@ from learn_assist.itembank import (
     select_b_chapter,
     check_coverage_chapter,
     merge_tags_chapter,
-    update_b_item_statuses
+    update_b_item_statuses,
+    screen_feedback_chapter
 )
 
 
@@ -1867,6 +1868,136 @@ def test_b_item_status_updates(tmp_path: Path):
     assert json.loads((items_dir / "B_claude_03.json").read_text(encoding="utf-8"))["status"] == "flagged_difficulty"
     assert json.loads((items_dir / "B_claude_04.json").read_text(encoding="utf-8"))["status"] == "excluded_solver_flag"
     assert json.loads((items_dir / "B_claude_05.json").read_text(encoding="utf-8"))["status"] == "disputed"
+
+
+def test_coverage_exceptions(tmp_path: Path):
+    """
+    Tests coverage_exceptions:
+    - Documented concepts in coverage_exceptions.json report as WARN and success=True
+    - Undocumented concepts fail with success=False
+    """
+    data_dir = tmp_path / "data"
+    ch_dir = data_dir / "itembank" / "ch01"
+    items_dir = ch_dir / "items"
+    tags_dir = ch_dir / "tags"
+    items_dir.mkdir(parents=True)
+    tags_dir.mkdir(parents=True)
+
+    concepts = [
+        {"concept_id": "1.1", "title": "Concept 1"},
+        {"concept_id": "1.2", "title": "Concept 2"},
+        {"concept_id": "1.3", "title": "Concept 3"}
+    ]
+    (ch_dir / "concepts.json").write_text(json.dumps(concepts), encoding="utf-8")
+
+    # Usable A item covering 1.1 only
+    (items_dir / "A_1.01.json").write_text(json.dumps({
+        "item_id": "A_1.01", "bucket": "A", "status": "usable", "concepts": ["1.1"]
+    }), encoding="utf-8")
+    (ch_dir / "resolution.json").write_text(json.dumps({"usable_item_ids": ["A_1.01"]}), encoding="utf-8")
+
+    # Tags mention 1.2 as potential A candidate
+    (tags_dir / "claude.json").write_text(json.dumps({"A_1.01": ["1.1", "1.2"]}), encoding="utf-8")
+
+    # selection_b empty
+    (ch_dir / "selection_b.json").write_text(json.dumps({"selected_items": []}), encoding="utf-8")
+
+    # Case 1: No exceptions file -> 1.2 uncovered with candidate -> failure
+    rep1 = check_coverage_chapter(1, data_dir=data_dir)
+    assert rep1["success"] is False
+    assert "1.2" in rep1["uncovered_a_failures"]
+    assert rep1["uncovered_a_warnings"] == []
+
+    with pytest.raises(SystemExit):
+        check_coverage_chapter(1, data_dir=data_dir, exit_on_failure=True)
+
+    # Case 2: Documented exception for 1.2 -> reported as WARN, success=True
+    exceptions = {
+        "1.2": "Documented test exception"
+    }
+    (ch_dir / "coverage_exceptions.json").write_text(json.dumps(exceptions), encoding="utf-8")
+
+    rep2 = check_coverage_chapter(1, data_dir=data_dir)
+    assert rep2["success"] is True
+    assert rep2["uncovered_a_failures"] == []
+    assert "1.2" in rep2["uncovered_a_warnings"]
+    assert rep2["exceptions"]["1.2"] == "Documented test exception"
+
+    # Should not raise SystemExit
+    check_coverage_chapter(1, data_dir=data_dir, exit_on_failure=True)
+
+    # Case 3: Another undocumented candidate gap (e.g. 1.3) -> fails despite 1.2 having exception
+    (tags_dir / "claude.json").write_text(json.dumps({"A_1.01": ["1.1", "1.2", "1.3"]}), encoding="utf-8")
+    rep3 = check_coverage_chapter(1, data_dir=data_dir)
+    assert rep3["success"] is False
+    assert "1.3" in rep3["uncovered_a_failures"]
+    assert "1.2" in rep3["uncovered_a_warnings"]
+
+
+def test_screen_feedback(tmp_path: Path):
+    """
+    Tests screen_feedback_chapter:
+    - Filters by author family
+    - Includes only flagged items
+    - Computes length ratio and passes through confidences
+    """
+    data_dir = tmp_path / "data"
+    ch_dir = data_dir / "itembank" / "ch01"
+    ch_dir.mkdir(parents=True)
+
+    diff_data = {
+        "items": {
+            "B_gemini_01": {
+                "author_family": "gemini",
+                "anchor_item": "A_1.01",
+                "status": "flagged",
+                "flagged": True,
+                "b_chars": 100,
+                "a_chars": 500,
+                "b_confidence": "high",
+                "a_confidence": "high"
+            },
+            "B_gemini_02": {
+                "author_family": "gemini",
+                "anchor_item": "A_1.02",
+                "status": "passed",
+                "flagged": False,
+                "b_chars": 600,
+                "a_chars": 500,
+                "b_confidence": "high",
+                "a_confidence": "high"
+            },
+            "B_claude_01": {
+                "author_family": "claude",
+                "anchor_item": "A_1.03",
+                "status": "flagged",
+                "flagged": True,
+                "b_chars": 200,
+                "a_chars": 400,
+                "b_confidence": "medium",
+                "a_confidence": "high"
+            }
+        }
+    }
+    (ch_dir / "difficulty.json").write_text(json.dumps(diff_data), encoding="utf-8")
+
+    # Feedback for gemini
+    fb_g = screen_feedback_chapter(1, "gemini", data_dir=data_dir)
+    assert len(fb_g) == 1
+    assert fb_g[0]["item_id"] == "B_gemini_01"
+    assert fb_g[0]["anchor_id"] == "A_1.01"
+    assert fb_g[0]["ratio"] == 0.2
+    assert fb_g[0]["b_confidence"] == "high"
+    assert fb_g[0]["a_confidence"] == "high"
+
+    # Feedback for claude
+    fb_c = screen_feedback_chapter(1, "claude", data_dir=data_dir)
+    assert len(fb_c) == 1
+    assert fb_c[0]["item_id"] == "B_claude_01"
+    assert fb_c[0]["anchor_id"] == "A_1.03"
+    assert fb_c[0]["ratio"] == 0.5
+    assert fb_c[0]["b_confidence"] == "medium"
+    assert fb_c[0]["a_confidence"] == "high"
 
 
 
