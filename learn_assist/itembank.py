@@ -612,7 +612,8 @@ POSITIVE_CONVENTION_SYMBOLS: Set[str] = {
 OTHER_CONVENTION_SYMBOLS: Set[str] = {
     "Delta_B", "omega_rf", "Delta_omega", "omega_eff", "f0",
     "alpha", "t", "theta", "phi", "varphi", "I_s", "m_I",
-    "x", "y", "z", "r", "k"
+    "x", "y", "z", "r", "k",
+    "n", "m", "omega", "a", "b", "c", "x0", "k0", "W", "W_x", "Delta_x", "p", "q"
 }
 
 CONVENTION_SYMBOLS: Set[str] = POSITIVE_CONVENTION_SYMBOLS | OTHER_CONVENTION_SYMBOLS
