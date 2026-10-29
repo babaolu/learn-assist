@@ -11,7 +11,6 @@ Provides count-only status reports.
 
 import argparse
 import json
-import os
 import re
 import sys
 import time
